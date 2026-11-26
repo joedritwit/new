@@ -14,10 +14,13 @@ import type {
   ThreadDetail,
 } from '../src/shared/types'
 import { FOIA_TEMPLATES } from '../src/shared/foia'
+import { filterRichStyles } from '../src/shared/richtext'
 import { createApp } from '../src/worker/app'
 import { currentUser, type Env } from '../src/worker/auth'
 import { renderMarkdown, extractEmbeds } from '../src/worker/markdown'
 import { sniffImage, stripMetadata } from '../src/worker/media'
+import { sanitizeRichHtml } from '../src/worker/richtext'
+import { seedDatabase } from '../src/worker/seed'
 
 const runtime = new Miniflare({
   workers: [
@@ -61,10 +64,13 @@ afterAll(() => runtime.dispose())
 
 // This identity seam exists only in the app factory. The Worker entrypoint
 // never reads these test headers and always calls the real auth SDK.
-const app = createApp(async (request) => {
-  const sub = request.headers.get('test-user')
-  return sub ? { sub } : null
-})
+const app = createApp(
+  async (request) => {
+    const sub = request.headers.get('test-user')
+    return sub ? { sub } : null
+  },
+  async (_env, token) => token === 'turnstile-ok',
+)
 
 const read = (path: string, user?: string) =>
   app.request(
@@ -121,6 +127,130 @@ test('markdown is sanitised and media links become embed descriptors', () => {
   ])
 })
 
+test('editor formatting renders only allowlisted tags and classes', () => {
+  const { html } = renderMarkdown(
+    [
+      '**bold** *italic* ~~gone~~ [u]under[/u]',
+      '',
+      '[color=red]red[/color] [size=lg]large[/size] [font=serif]serif[/font]',
+      '',
+      '[color=red]**nested**[/color]',
+      '',
+      '[color=red]a[/u]b[/color]',
+    ].join('\n'),
+  )
+
+  expect(html).toContain('<strong>bold</strong>')
+  expect(html).toContain('<em>italic</em>')
+  expect(html).toContain('<del>gone</del>')
+  expect(html).toContain('<u>under</u>')
+  expect(html).toContain('<span class="tone-red">red</span>')
+  expect(html).toContain('<span class="size-lg">large</span>')
+  expect(html).toContain('<span class="face-serif">serif</span>')
+  expect(html).toContain('<span class="tone-red"><strong>nested</strong></span>')
+  expect(html).toContain('<span class="tone-red">a[/u]b</span>')
+})
+
+test('formatting values, raw HTML, and code are not trusted', () => {
+  const { html } = renderMarkdown(
+    [
+      '[color=chartreuse]nope[/color]',
+      '[size=huge]nope[/size]',
+      '[font=comic]nope[/font]',
+      '[u]unclosed',
+      '<u>raw</u>',
+      '<span class="tone-red" style="color:red">raw</span>',
+      '`[u]code[/u]`',
+      '```',
+      '[color=red]block[/color]',
+      '```',
+    ].join('\n'),
+  )
+
+  expect(html).toContain('[color=chartreuse]nope[/color]')
+  expect(html).toContain('[size=huge]nope[/size]')
+  expect(html).toContain('[font=comic]nope[/font]')
+  expect(html).toContain('[u]unclosed')
+  expect(html).not.toContain('<u>raw</u>')
+  expect(html).not.toContain('style=')
+  expect(html).toContain('<code>[u]code[/u]</code>')
+  expect(html).toContain('[color=red]block[/color]')
+})
+
+test('rich HTML maps editor styles to allowlisted classes', () => {
+  const result = sanitizeRichHtml(
+    [
+      '<p><strong>bold</strong> <span style="color: #F7A1A1; font-size: 24px">red</span></p>',
+      '<p style="text-align: center"><a href="https://example.com/source">source</a><img src="/api/files/11111111-1111-4111-8111-111111111111" alt="evidence"></p>',
+    ].join(''),
+  )
+
+  expect(result.html).toContain('<strong>bold</strong>')
+  expect(result.html).toContain('class="tx-rose fs-24"')
+  expect(result.html).toContain('class="align-center"')
+  expect(result.html).toContain(
+    'src="/api/files/11111111-1111-4111-8111-111111111111"',
+  )
+  expect(result.html).toContain('rel="nofollow ugc noopener"')
+  expect(result.html).not.toContain('style=')
+  expect(result.text).toBe('bold red\n\nsource')
+  expect(result.links).toEqual(['https://example.com/source'])
+})
+
+test('rich HTML normalizes rgb and rgba palette colors', () => {
+  const rgb = sanitizeRichHtml(
+    '<p><span style="color: rgb(247, 161, 161)">rose</span></p>',
+  )
+  expect(rgb.html).toContain('class="tx-rose"')
+  expect(rgb.html).not.toContain('style=')
+
+  const rgba = sanitizeRichHtml(
+    '<p><span style="color: rgba(247, 161, 161, 1)">rose</span></p>',
+  )
+  expect(rgba.html).toContain('class="tx-rose"')
+  expect(rgba.html).not.toContain('style=')
+
+  const custom = sanitizeRichHtml(
+    '<p><span style="color: rgb(255, 0, 0)">custom</span></p>',
+  )
+  expect(custom.html).not.toContain('tx-')
+  expect(custom.html).not.toContain('style=')
+  expect(custom.html).toContain('<span>custom</span>')
+
+  expect(filterRichStyles('color: rgb(247, 161, 161)')).toBe(
+    'color: #F7A1A1',
+  )
+  expect(filterRichStyles('color: rgba(247, 161, 161, 1)')).toBe(
+    'color: #F7A1A1',
+  )
+  expect(filterRichStyles('color: rgb(255, 0, 0)')).toBe('')
+})
+
+test('rich HTML drops scripts, unsafe URLs, and unknown styles', () => {
+  const result = sanitizeRichHtml(
+    [
+      '<p onclick="alert(1)">safe<script>alert(1)</script></p>',
+      '<a href="javascript:alert(1)">bad</a>',
+      '<a href="//evil.example">protocol relative</a>',
+      '<span style="background: url(javascript:alert(1)); color: #F7A1A1; font-size: 100px">red</span>',
+      '<img src="https://evil.example/tracker.png">',
+      '<img src="/api/files/not-a-uuid">',
+      '<p style="text-align: justify">justified</p>',
+    ].join(''),
+  )
+
+  expect(result.html).not.toContain('<script')
+  expect(result.html).not.toContain('onclick')
+  expect(result.html).not.toContain('javascript:')
+  expect(result.html).not.toContain('evil.example')
+  expect(result.html).not.toContain('not-a-uuid')
+  expect(result.html).not.toContain('background')
+  expect(result.html).not.toContain('font-size')
+  expect(result.html).not.toContain('align-justify')
+  expect(result.html).toContain('class="tx-rose"')
+  expect(result.html).toContain('safe')
+})
+
 test('board index is seeded with the full tree and live activity', async () => {
   const response = await read('/api/boards')
   expect(response.status).toBe(200)
@@ -149,9 +279,109 @@ test('board index is seeded with the full tree and live activity', async () => {
     latest: { threadSlug: 'post-office-lobby-asked-to-stop' },
   })
 
-  expect(body.stats.threads).toBeGreaterThanOrEqual(13)
-  expect(body.stats.posts).toBeGreaterThanOrEqual(40)
+  expect(body.stats.threads).toBeGreaterThanOrEqual(12)
+  expect(body.stats.posts).toBeGreaterThanOrEqual(36)
   expect(body.stats.members).toBeGreaterThanOrEqual(6)
+})
+
+test('seed timestamps are real and the v3 repair fixes zero-clock rows', async () => {
+  const boardIndex = (await (await read('/api/boards')).json()) as BoardIndex
+  const stamps = boardIndex.categories
+    .flatMap((category) => category.subcategories)
+    .map((subcategory) => subcategory.latest?.at)
+    .filter((at): at is number => typeof at === 'number')
+  expect(stamps).toHaveLength(12)
+  expect(stamps.every((at) => at > Date.now() - 90 * 86_400_000)).toBe(true)
+
+  const runtime = new Miniflare({
+    workers: [
+      {
+        config: {
+          name: 'seed-repair',
+          compatibilityDate: '2026-11-11',
+          manifest: {
+            mainModule: 'index.js',
+            modules: {
+              'index.js': {
+                type: 'esm',
+                contents:
+                  'export default { fetch() { return new Response("x") } }',
+              },
+            },
+          },
+          env: { DB: { type: 'd1', name: 'seed-repair' } },
+        },
+      },
+    ],
+    port: 0,
+  })
+  const db = (await runtime.getD1Database('DB')) as unknown as D1Database
+
+  // A v1 database whose module-scope clock wrote `0 - offset` timestamps.
+  await db.batch([
+    db.prepare(
+      'CREATE TABLE app_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)',
+    ),
+    db.prepare("INSERT INTO app_meta (key, value) VALUES ('seed:v1', '1')"),
+    db.prepare('CREATE TABLE users (id TEXT PRIMARY KEY, joined_at INTEGER NOT NULL)'),
+    db.prepare(
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL)',
+    ),
+    db.prepare(
+      'CREATE TABLE posts (id TEXT PRIMARY KEY, thread_id TEXT, body TEXT, created_at INTEGER NOT NULL)',
+    ),
+    db.prepare('CREATE TABLE thread_tags (thread_id TEXT, tag_id TEXT)'),
+    db.prepare("INSERT INTO users (id, joined_at) VALUES ('seed:redline', -1000000)"),
+    db.prepare(
+      "INSERT INTO threads (id, title, created_at, last_activity_at) VALUES ('th:board-open', 'old', -172800000, -172800000)",
+    ),
+    db.prepare(
+      "INSERT INTO threads (id, title, created_at, last_activity_at) VALUES ('th:metadata', 'kept', -172800000, 9999999999999)",
+    ),
+    db.prepare(
+      "INSERT INTO posts (id, thread_id, body, created_at) VALUES ('th:board-open:p0', 'th:board-open', 'old', -172800000)",
+    ),
+    db.prepare(
+      "INSERT INTO posts (id, thread_id, body, created_at) VALUES ('th:metadata:p0', 'th:metadata', 'old', -172800000)",
+    ),
+  ])
+
+  await seedDatabase(db)
+
+  const thread = await db
+    .prepare(
+      "SELECT created_at AS at, last_activity_at AS last FROM threads WHERE id = 'th:board-open'",
+    )
+    .first<{ at: number; last: number }>()
+  expect(Math.abs(thread!.at - (Date.now() - 172_800_000))).toBeLessThan(10_000)
+  expect(Math.abs(thread!.last - (Date.now() - 172_800_000))).toBeLessThan(
+    10_000,
+  )
+
+  // A thread kept alive by a real reply keeps the real timestamp.
+  const replied = await db
+    .prepare("SELECT last_activity_at AS last FROM threads WHERE id = 'th:metadata'")
+    .first<{ last: number }>()
+  expect(replied!.last).toBe(9999999999999)
+
+  const user = await db
+    .prepare("SELECT joined_at AS at FROM users WHERE id = 'seed:redline'")
+    .first<{ at: number }>()
+  expect(Math.abs(user!.at - (Date.now() - 1_000_000))).toBeLessThan(10_000)
+  expect(
+    await db
+      .prepare("SELECT value FROM app_meta WHERE key = 'seed:v3'")
+      .first(),
+  ).not.toBeNull()
+
+  // The marker makes a second run a no-op.
+  await seedDatabase(db)
+  const again = await db
+    .prepare("SELECT created_at AS at FROM threads WHERE id = 'th:board-open'")
+    .first<{ at: number }>()
+  expect(again!.at).toBe(thread!.at)
+
+  await runtime.dispose()
 })
 
 test('thread view renders sanitised HTML and author handles', async () => {
@@ -195,6 +425,85 @@ test('session provisions a local account at trust level zero', async () => {
     trustLevel: 0,
   })
   expect((await read('/api/users/nobody-here')).status).toBe(404)
+})
+
+test('registration requires Turnstile once a secret is configured', async () => {
+  const guardedEnv = { ...env, TURNSTILE_SECRET_KEY: 'test-secret' } as Env
+
+  const sessionRequest = (user: string, token?: string) =>
+    app.request(
+      'https://app.example.test/api/session',
+      {
+        headers: {
+          'test-user': user,
+          ...(token ? { 'X-Turnstile-Token': token } : {}),
+        },
+      },
+      guardedEnv,
+    )
+
+  const missing = await sessionRequest('gate-new')
+  expect(missing.status).toBe(403)
+  expect(((await missing.json()) as { code: string }).code).toBe(
+    'turnstile_required',
+  )
+
+  const wrong = await sessionRequest('gate-new', 'not-a-real-token')
+  expect(wrong.status).toBe(403)
+  expect(((await wrong.json()) as { code: string }).code).toBe(
+    'turnstile_failed',
+  )
+
+  // Public reads still work, but never provision the account silently.
+  const readOnly = await app.request(
+    'https://app.example.test/api/boards',
+    { headers: { 'test-user': 'gate-reader' } },
+    guardedEnv,
+  )
+  expect(readOnly.status).toBe(200)
+  expect(
+    await env.DB!.prepare('SELECT 1 AS found FROM users WHERE id = ?')
+      .bind('gate-reader')
+      .first(),
+  ).toBeNull()
+
+  // Writes are gated too, so no other route can create the first account.
+  const writeAttempt = await app.request(
+    'https://app.example.test/api/threads',
+    {
+      method: 'POST',
+      headers: {
+        'test-user': 'gate-writer',
+        'Content-Type': 'application/json',
+        Origin: env.APP_ORIGIN!,
+      },
+      body: JSON.stringify({
+        boardId: 'general',
+        title: 'Blocked by verification',
+        body: 'Should not be posted.',
+      }),
+    },
+    guardedEnv,
+  )
+  expect(writeAttempt.status).toBe(403)
+  expect(((await writeAttempt.json()) as { code: string }).code).toBe(
+    'turnstile_required',
+  )
+
+  const allowed = await sessionRequest('gate-new', 'turnstile-ok')
+  expect(allowed.status).toBe(200)
+  expect(((await allowed.json()) as Session).viewer?.handle).toBeTruthy()
+
+  // Once the account exists the challenge is not repeated.
+  expect((await sessionRequest('gate-new')).status).toBe(200)
+
+  // Without a secret the gate stays off, matching local development.
+  const open = await app.request(
+    'https://app.example.test/api/session',
+    { headers: { 'test-user': 'gate-open' } },
+    env,
+  )
+  expect(open.status).toBe(200)
 })
 
 test('posting requires a session and a same-origin request', async () => {
@@ -266,6 +575,54 @@ test('a member can start a thread and reply, and it reaches the board', async ()
       })
     ).status,
   ).toBe(403)
+})
+
+test('a rich thread stores canonical HTML and derived plain text', async () => {
+  const created = await write('POST', '/api/threads', 'writer', {
+    boardId: 'general',
+    title: 'A rich text field note',
+    html: [
+      '<p>Hello <strong>world</strong> <span style="color: #F7A1A1">red</span><script>alert(1)</script></p>',
+      '<p style="text-align: center"><a href="/t/example">source</a></p>',
+    ].join(''),
+  })
+  expect(created.status).toBe(201)
+  const { slug } = (await created.json()) as { slug: string }
+
+  const replied = await write(
+    'POST',
+    `/api/threads/${slug}/posts`,
+    'rich-replier',
+    { html: '<p><em>reply</em></p>' },
+  )
+  expect(replied.status).toBe(201)
+
+  const thread = (await (
+    await read(`/api/threads/${slug}`)
+  ).json()) as ThreadDetail
+  expect(thread.posts).toHaveLength(2)
+  expect(thread.posts[0]!.body).toBe('Hello world red\n\nsource')
+  expect(thread.posts[0]!.html).toContain('<strong>world</strong>')
+  expect(thread.posts[0]!.html).toContain('class="tx-rose"')
+  expect(thread.posts[0]!.html).toContain('class="align-center"')
+  expect(thread.posts[0]!.html).toContain('href="/t/example"')
+  expect(thread.posts[0]!.html).not.toContain('<script')
+  expect(thread.posts[0]!.html).not.toContain('style=')
+  expect(thread.posts[0]!.embeds).toEqual([])
+  expect(thread.posts[1]!.body).toBe('reply')
+  expect(thread.posts[1]!.html).toContain('<em>reply</em>')
+})
+
+test('rich HTML links are gated for new accounts', async () => {
+  const blocked = await write('POST', '/api/threads', 'rich-newbie', {
+    boardId: 'general',
+    title: 'A rich post with an external source',
+    html: '<p>Source: <a href="https://example.com/policy">example</a></p>',
+  })
+  expect(blocked.status).toBe(403)
+  expect(((await blocked.json()) as { error: string }).error).toMatch(
+    /Links unlock/,
+  )
 })
 
 test('new accounts cannot post links until they earn trust', async () => {
@@ -642,6 +999,278 @@ test('three warning points mute an account until the warning is revoked', async 
     await read(`/api/users/${replyPost.author.handle}`)
   ).json()) as ProfileView
   expect(publicProfile.staff).toBeNull()
+})
+
+test('moderators cannot warn or revoke themselves or their peers', async () => {
+  await read('/api/session', 'guard-admin')
+  await promote('guard-admin', 'admin')
+  const modSession = (await (
+    await read('/api/session', 'guard-mod')
+  ).json()) as Session
+  await promote('guard-mod', 'moderator')
+  const peerSession = (await (
+    await read('/api/session', 'guard-mod-two')
+  ).json()) as Session
+  await promote('guard-mod-two', 'moderator')
+
+  expect(
+    (
+      await write('POST', '/api/mod/users/guard-mod/warnings', 'guard-mod', {
+        points: 1,
+        reason: 'Warning myself.',
+      })
+    ).status,
+  ).toBe(403)
+  expect(
+    (
+      await write('POST', '/api/mod/users/guard-mod-two/warnings', 'guard-mod', {
+        points: 1,
+        reason: 'Warning a peer.',
+      })
+    ).status,
+  ).toBe(403)
+
+  expect(
+    (
+      await write(
+        'POST',
+        '/api/mod/users/guard-mod-two/warnings',
+        'guard-admin',
+        { points: 1, reason: 'Admin warning for a moderator.' },
+      )
+    ).status,
+  ).toBe(200)
+
+  const peer = (await (
+    await read(`/api/users/${peerSession.viewer!.handle}`, 'guard-admin')
+  ).json()) as ProfileView
+  const peerWarning = peer.staff!.warnings[0]!
+  expect(
+    (
+      await write(
+        'POST',
+        `/api/mod/warnings/${peerWarning.id}/revoke`,
+        'guard-mod',
+        { reason: 'Revoking a peer warning.' },
+      )
+    ).status,
+  ).toBe(403)
+
+  expect(
+    (
+      await write('POST', '/api/mod/users/guard-mod/warnings', 'guard-admin', {
+        points: 1,
+        reason: 'Admin warning for the other moderator.',
+      })
+    ).status,
+  ).toBe(200)
+  const self = (await (
+    await read(`/api/users/${modSession.viewer!.handle}`, 'guard-admin')
+  ).json()) as ProfileView
+  const selfWarning = self.staff!.warnings[0]!
+  expect(
+    (
+      await write(
+        'POST',
+        `/api/mod/warnings/${selfWarning.id}/revoke`,
+        'guard-mod',
+        { reason: 'Revoking my own warning.' },
+      )
+    ).status,
+  ).toBe(403)
+  expect(
+    (
+      await write(
+        'POST',
+        `/api/mod/warnings/${selfWarning.id}/revoke`,
+        'guard-admin',
+        { reason: 'Admin corrects it.' },
+      )
+    ).status,
+  ).toBe(200)
+})
+
+test('report actions stop self-handling and staff content for moderators', async () => {
+  await read('/api/session', 'guard-admin')
+  await promote('guard-admin', 'admin')
+  await read('/api/session', 'guard-mod')
+  await promote('guard-mod', 'moderator')
+
+  // A moderator cannot remove or lock content authored by another moderator.
+  const staffThread = await threadWithSlug(
+    'guard-staff',
+    'A thread opened by a moderator',
+    'Staff content under report.',
+  )
+  expect(staffThread.status).toBe(201)
+  await promote('guard-staff', 'moderator')
+
+  const staffPost = (await (
+    await read(`/api/threads/${staffThread.body.slug}`)
+  ).json()) as ThreadDetail
+  const staffPostId = staffPost.posts[0]!.id
+
+  expect(
+    (
+      await write('POST', '/api/reports', 'guard-reporter', {
+        postId: staffPostId,
+        reason: 'off_topic',
+      })
+    ).status,
+  ).toBe(201)
+
+  const staffReport = (await (
+    await read('/api/mod/reports', 'guard-mod')
+  ).json()) as ModQueue
+  const staffReportId = staffReport.reports.find(
+    (entry) => entry.post.id === staffPostId,
+  )!.id
+
+  expect(
+    (
+      await write(
+        'POST',
+        `/api/mod/reports/${staffReportId}/action`,
+        'guard-mod',
+        { action: 'remove_post', note: 'Removing staff content.' },
+      )
+    ).status,
+  ).toBe(403)
+  expect(
+    (
+      await write(
+        'POST',
+        `/api/mod/reports/${staffReportId}/action`,
+        'guard-mod',
+        { action: 'lock_thread', note: 'Locking staff content.' },
+      )
+    ).status,
+  ).toBe(403)
+  expect(
+    (
+      await write(
+        'POST',
+        `/api/mod/reports/${staffReportId}/action`,
+        'guard-admin',
+        { action: 'remove_post', note: 'Admin removes staff content.' },
+      )
+    ).status,
+  ).toBe(200)
+
+  const after = (await (
+    await read(`/api/threads/${staffThread.body.slug}`)
+  ).json()) as ThreadDetail
+  expect(after.posts).toHaveLength(0)
+
+  // A moderator cannot handle a report they filed themselves.
+  const memberThread = await threadWithSlug(
+    'guard-target',
+    'A member thread a moderator reports',
+    'Reported by a moderator.',
+  )
+  expect(memberThread.status).toBe(201)
+  const memberPost = (await (
+    await read(`/api/threads/${memberThread.body.slug}`)
+  ).json()) as ThreadDetail
+  const memberPostId = memberPost.posts[0]!.id
+
+  expect(
+    (
+      await write('POST', '/api/reports', 'guard-mod', {
+        postId: memberPostId,
+        reason: 'off_topic',
+      })
+    ).status,
+  ).toBe(201)
+
+  const own = (await (
+    await read('/api/mod/reports', 'guard-mod')
+  ).json()) as ModQueue
+  const ownReportId = own.reports.find(
+    (entry) => entry.post.id === memberPostId,
+  )!.id
+
+  expect(
+    (
+      await write('POST', `/api/mod/reports/${ownReportId}/action`, 'guard-mod', {
+        action: 'dismiss',
+        note: 'Dismissing my own report.',
+      })
+    ).status,
+  ).toBe(403)
+  expect(
+    (
+      await write('POST', `/api/mod/reports/${ownReportId}/action`, 'guard-admin', {
+        action: 'dismiss',
+        note: 'Admin closes it.',
+      })
+    ).status,
+  ).toBe(200)
+})
+
+test('moderators cannot act on reports about their own posts', async () => {
+  await read('/api/session', 'guard-admin')
+  await promote('guard-admin', 'admin')
+  await read('/api/session', 'guard-mod')
+  await promote('guard-mod', 'moderator')
+
+  const ownThread = await threadWithSlug(
+    'guard-mod',
+    'A moderator post that gets reported',
+    'Reported, but authored by the moderator handling the queue.',
+  )
+  expect(ownThread.status).toBe(201)
+  const ownPost = (await (
+    await read(`/api/threads/${ownThread.body.slug}`)
+  ).json()) as ThreadDetail
+  const ownPostId = ownPost.posts[0]!.id
+
+  expect(
+    (
+      await write('POST', '/api/reports', 'guard-reporter', {
+        postId: ownPostId,
+        reason: 'off_topic',
+      })
+    ).status,
+  ).toBe(201)
+
+  const queue = (await (
+    await read('/api/mod/reports', 'guard-mod')
+  ).json()) as ModQueue
+  const reportId = queue.reports.find(
+    (entry) => entry.post.id === ownPostId,
+  )!.id
+
+  expect(
+    (
+      await write('POST', `/api/mod/reports/${reportId}/action`, 'guard-mod', {
+        action: 'claim',
+        note: 'Claiming a report about me.',
+      })
+    ).status,
+  ).toBe(403)
+  expect(
+    (
+      await write('POST', `/api/mod/reports/${reportId}/action`, 'guard-mod', {
+        action: 'dismiss',
+        note: 'Dismissing a report about me.',
+      })
+    ).status,
+  ).toBe(403)
+
+  const untouched = (await (
+    await read(`/api/threads/${ownThread.body.slug}`)
+  ).json()) as ThreadDetail
+  expect(untouched.posts).toHaveLength(1)
+
+  expect(
+    (
+      await write('POST', `/api/mod/reports/${reportId}/action`, 'guard-admin', {
+        action: 'dismiss',
+        note: 'Admin closes it.',
+      })
+    ).status,
+  ).toBe(200)
 })
 
 test('removing a reported post hides it from the thread', async () => {
@@ -1093,6 +1722,158 @@ test('staff can attach and remove a board banner, members cannot upload one', as
   expect(
     (await (await read('/api/boards/general')).json() as BoardDetail).board.imageMediaId,
   ).toBeNull()
+})
+
+test('a public profile hides staff-only excerpts and titles', async () => {
+  await read('/api/session', 'leak-admin')
+  await promote('leak-admin', 'admin')
+  await read('/api/session', 'leak-author')
+  await promote('leak-author', 'supporter')
+
+  const category = (await (
+    await write('POST', '/api/admin/categories', 'leak-admin', {
+      name: 'Profile Leaks',
+      description: 'Regression tests for profile visibility.',
+    })
+  ).json()) as { id: string }
+  const board = (await (
+    await write('POST', '/api/admin/boards', 'leak-admin', {
+      categoryId: category.id,
+      name: 'Back Room',
+      description: 'Supporters and staff only.',
+    })
+  ).json()) as { id: string }
+  expect(
+    (
+      await write('PATCH', `/api/admin/boards/${board.id}`, 'leak-admin', {
+        staffOnly: true,
+      })
+    ).status,
+  ).toBe(200)
+
+  const publicThread = await threadWithSlug(
+    'leak-author',
+    'A public field note',
+    'This one is readable by everyone.',
+  )
+  expect(publicThread.status).toBe(201)
+
+  const staffThread = await write('POST', '/api/threads', 'leak-author', {
+    boardId: board.id,
+    title: 'A restricted field note',
+    body: 'Only supporters and staff should read this excerpt.',
+  })
+  expect(staffThread.status).toBe(201)
+  const staffSlug = ((await staffThread.json()) as { slug: string }).slug
+
+  const session = (await (
+    await read('/api/session', 'leak-author')
+  ).json()) as Session
+  const handle = session.viewer!.handle
+
+  const guestView = (await (
+    await read(`/api/users/${handle}`)
+  ).json()) as ProfileView
+  expect(guestView.recent.map((post) => post.threadSlug)).toContain(
+    publicThread.body.slug,
+  )
+  expect(guestView.recent.map((post) => post.threadSlug)).not.toContain(staffSlug)
+  expect(JSON.stringify(guestView.recent)).not.toContain(
+    'Only supporters and staff',
+  )
+
+  const supporterView = (await (
+    await read(`/api/users/${handle}`, 'leak-author')
+  ).json()) as ProfileView
+  expect(supporterView.recent.map((post) => post.threadSlug)).toContain(
+    staffSlug,
+  )
+})
+
+test('staff-only post images stay private while public ones do not', async () => {
+  await read('/api/session', 'image-admin')
+  await promote('image-admin', 'admin')
+  await read('/api/session', 'image-author')
+  await promote('image-author', 'supporter')
+
+  const category = (await (
+    await write('POST', '/api/admin/categories', 'image-admin', {
+      name: 'Image Leaks',
+      description: 'Regression tests for media visibility.',
+    })
+  ).json()) as { id: string }
+  const sealed = (await (
+    await write('POST', '/api/admin/boards', 'image-admin', {
+      categoryId: category.id,
+      name: 'Sealed Room',
+      description: 'Supporters and staff only.',
+    })
+  ).json()) as { id: string }
+  expect(
+    (
+      await write('PATCH', `/api/admin/boards/${sealed.id}`, 'image-admin', {
+        staffOnly: true,
+      })
+    ).status,
+  ).toBe(200)
+
+  const sealedUpload = await upload('image-author', 'post_image', PNG_1X1)
+  expect(sealedUpload.status).toBe(201)
+  const sealedMedia = ((await sealedUpload.json()) as { media: { id: string } })
+    .media
+
+  expect(
+    (
+      await write('POST', '/api/threads', 'image-author', {
+        boardId: sealed.id,
+        title: 'Evidence from the sealed room',
+        body: `![evidence](/api/files/${sealedMedia.id})`,
+      })
+    ).status,
+  ).toBe(201)
+
+  expect((await read(`/api/files/${sealedMedia.id}`)).status).toBe(404)
+  expect(
+    (await read(`/api/files/${sealedMedia.id}`, 'image-outsider')).status,
+  ).toBe(404)
+  const allowed = await read(`/api/files/${sealedMedia.id}`, 'image-author')
+  expect(allowed.status).toBe(200)
+  expect(allowed.headers.get('Cache-Control')).toContain('private')
+
+  // A public board's image is still public, until the board itself is sealed.
+  const open = (await (
+    await write('POST', '/api/admin/boards', 'image-admin', {
+      categoryId: category.id,
+      name: 'Open Room',
+      description: 'Anyone can read this one.',
+    })
+  ).json()) as { id: string }
+  const openUpload = await upload('image-outsider', 'post_image', PNG_1X1)
+  expect(openUpload.status).toBe(201)
+  const openMedia = ((await openUpload.json()) as { media: { id: string } })
+    .media
+  expect(
+    (
+      await write('POST', '/api/threads', 'image-outsider', {
+        boardId: open.id,
+        title: 'Evidence from the open room',
+        body: `![evidence](/api/files/${openMedia.id})`,
+      })
+    ).status,
+  ).toBe(201)
+  expect((await read(`/api/files/${openMedia.id}`)).status).toBe(200)
+
+  expect(
+    (
+      await write('PATCH', `/api/admin/boards/${open.id}`, 'image-admin', {
+        staffOnly: true,
+      })
+    ).status,
+  ).toBe(200)
+  expect((await read(`/api/files/${openMedia.id}`)).status).toBe(404)
+  expect((await read(`/api/files/${openMedia.id}`, 'image-author')).status).toBe(
+    200,
+  )
 })
 
 test('timestamps become seek links and new providers are extracted', () => {
