@@ -4,12 +4,14 @@ import type {
   ReportStatus,
   ReportView,
   StaffProfile,
+  StaffRole,
   WarningView,
 } from '../shared/types'
 import type { Env } from './auth'
 import { logAudit } from './audit'
 import { notifyReportClosed, notifyWarning } from './notifications'
 import { fail, ok, type MutationResult } from './result'
+import { atLeast, isStaff } from './roles'
 import { cleanName } from './text'
 import type { ViewerProfile } from './users'
 
@@ -175,9 +177,11 @@ type ActionTarget = {
   reportStatus: ReportStatus
   postId: string
   postAuthorId: string
+  postAuthorRole: StaffRole
   reporterId: string
   threadId: string
   threadSlug: string
+  threadAuthorRole: StaffRole
 }
 
 export async function applyReportAction(
@@ -194,10 +198,14 @@ export async function applyReportAction(
       `SELECT r.id AS reportId, r.status AS reportStatus,
               r.reporter_id AS reporterId,
               p.id AS postId, p.author_id AS postAuthorId,
-              t.id AS threadId, t.slug AS threadSlug
+              post_author.staff_role AS postAuthorRole,
+              t.id AS threadId, t.slug AS threadSlug,
+              thread_author.staff_role AS threadAuthorRole
        FROM reports r
        JOIN posts p ON p.id = r.target_id
        JOIN threads t ON t.id = p.thread_id
+       JOIN users post_author ON post_author.id = p.author_id
+       JOIN users thread_author ON thread_author.id = t.author_id
        WHERE r.id = ?`,
     )
     .bind(reportId)
@@ -209,6 +217,20 @@ export async function applyReportAction(
   const now = Date.now()
   const moderatorId = moderator.row.id
   const reason = note || null
+
+  // Staff boundaries are checked here as well as inside each mutation so no
+  // action slips through: nobody moderates their own report, and only admins
+  // act on content written by staff.
+  if (target.reporterId === moderatorId)
+    return fail(403, 'You cannot handle a report you filed yourself.')
+  if (target.postAuthorId === moderatorId)
+    return fail(403, 'You cannot act on a report about your own post.')
+  if (
+    !atLeast(moderator.row.staffRole, 'admin') &&
+    ((action === 'remove_post' && isStaff(target.postAuthorRole)) ||
+      (action === 'lock_thread' && isStaff(target.threadAuthorRole)))
+  )
+    return fail(403, 'Only an admin can act on staff content.')
 
   if (action === 'warn_user') {
     if (!reason) return fail(400, 'A warning needs a reason.')
@@ -359,12 +381,14 @@ export async function issueWarning(
     .first<{
       id: string
       name: string
-      staffRole: string
+      staffRole: StaffRole
       mutedUntil: number | null
     }>()
   if (!target) return fail(404, 'That member does not exist.')
-  if (target.staffRole === 'admin' && moderator.row.staffRole !== 'admin')
-    return fail(403, 'Only an admin can warn another admin.')
+  if (target.id === moderator.row.id)
+    return fail(403, 'You cannot warn yourself.')
+  if (isStaff(target.staffRole) && !atLeast(moderator.row.staffRole, 'admin'))
+    return fail(403, 'Only an admin can warn a staff account.')
 
   const now = Date.now()
   await db
@@ -439,10 +463,19 @@ export async function revokeWarning(
   reason: string,
 ): Promise<MutationResult<{ activePoints: number; mutedUntil: number | null }>> {
   const warning = await db
-    .prepare('SELECT id, user_id AS userId FROM warnings WHERE id = ?')
+    .prepare(
+      `SELECT w.id, w.user_id AS userId, u.staff_role AS staffRole
+       FROM warnings w
+       JOIN users u ON u.id = w.user_id
+       WHERE w.id = ?`,
+    )
     .bind(warningId)
-    .first<{ id: string; userId: string }>()
+    .first<{ id: string; userId: string; staffRole: StaffRole }>()
   if (!warning) return fail(404, 'That warning does not exist.')
+  if (warning.userId === moderator.row.id)
+    return fail(403, 'You cannot revoke your own warning.')
+  if (isStaff(warning.staffRole) && !atLeast(moderator.row.staffRole, 'admin'))
+    return fail(403, 'Only an admin can revoke a warning on a staff account.')
 
   const cleanReason = cleanName(reason).slice(0, REPORT_LIMITS.noteMax)
   if (!cleanReason) return fail(400, 'Say why the warning is being revoked.')

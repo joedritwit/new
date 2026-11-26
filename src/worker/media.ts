@@ -526,9 +526,11 @@ export async function setBoardImage(
   mediaId: string | null,
 ): Promise<MediaResult<null>> {
   const board = await db
-    .prepare('SELECT image_media_id AS mediaId FROM subcategories WHERE id = ?')
+    .prepare(
+      'SELECT image_media_id AS mediaId, staff_only AS staffOnly FROM subcategories WHERE id = ?',
+    )
     .bind(boardId)
-    .first<{ mediaId: string | null }>()
+    .first<{ mediaId: string | null; staffOnly: number }>()
   if (!board) return { ok: false, status: 404, error: 'That board does not exist.' }
 
   if (mediaId) {
@@ -547,12 +549,88 @@ export async function setBoardImage(
     .prepare('UPDATE subcategories SET image_media_id = ? WHERE id = ?')
     .bind(mediaId, boardId)
     .run()
+  if (mediaId) {
+    // The banner inherits its board's read permission so a staff-only board's
+    // artwork cannot be fetched by UUID from outside.
+    await db
+      .prepare(
+        `UPDATE media SET staff_only = ?
+         WHERE id = ? AND kind = 'board_banner'`,
+      )
+      .bind(board.staffOnly ? 1 : 0, mediaId)
+      .run()
+  }
   if (board.mediaId && board.mediaId !== mediaId)
     await deleteMedia(db, files, board.mediaId)
   return { ok: true, value: null }
 }
 
-export type FileRow = MediaRow & { staffOnly: number | null }
+export type FileRow = MediaRow & { staffOnly: number }
+
+const MEDIA_REF = /\/api\/files\/([A-Za-z0-9_-]{1,64})/g
+
+/** Media ids referenced as images inside a legacy or rich post body. */
+export function mediaIdsIn(body: string): string[] {
+  const ids = new Set<string>()
+  for (const match of body.matchAll(MEDIA_REF)) {
+    if (match[1]) ids.add(match[1])
+  }
+  return [...ids]
+}
+
+/**
+ * Raises the restriction flag on an author's post images once they are
+ * referenced from a staff-only board. The flag only rises here: an image
+ * shared into a public thread as well stays hidden rather than leaking.
+ */
+export async function restrictReferencedMedia(
+  db: D1Database,
+  ownerId: string,
+  body: string,
+): Promise<void> {
+  const ids = mediaIdsIn(body)
+  if (!ids.length) return
+  await db.batch(
+    ids.map((id) =>
+      db
+        .prepare(
+          `UPDATE media SET staff_only = 1
+           WHERE id = ? AND owner_id = ? AND kind = 'post_image'`,
+        )
+        .bind(id, ownerId),
+    ),
+  )
+}
+
+/** Marks every post image referenced from a board's posts as staff-only. */
+export async function restrictBoardPostMedia(
+  db: D1Database,
+  boardId: string,
+): Promise<void> {
+  const rows = await db
+    .prepare(
+      `SELECT p.body AS body, p.body_html AS bodyHtml, p.author_id AS authorId
+       FROM posts p
+       JOIN threads t ON t.id = p.thread_id
+       WHERE t.subcategory_id = ?`,
+    )
+    .bind(boardId)
+    .all<{ body: string; bodyHtml: string | null; authorId: string }>()
+
+  const statements = rows.results.flatMap((row) =>
+    mediaIdsIn(`${row.body}\n${row.bodyHtml ?? ''}`).map((id) =>
+      db
+        .prepare(
+          `UPDATE media SET staff_only = 1
+           WHERE id = ? AND owner_id = ? AND kind = 'post_image'`,
+        )
+        .bind(id, row.authorId),
+    ),
+  )
+  for (let index = 0; index < statements.length; index += 50) {
+    await db.batch(statements.slice(index, index + 50))
+  }
+}
 
 export async function mediaForFile(
   db: D1Database,
@@ -562,7 +640,8 @@ export async function mediaForFile(
     .prepare(
       `SELECT m.id, m.owner_id AS ownerId, m.kind, m.object_key AS objectKey,
               m.mime, m.bytes, m.width, m.height, m.sha256, m.status,
-              m.created_at AS createdAt, s.staff_only AS staffOnly
+              m.created_at AS createdAt,
+              CASE WHEN m.staff_only = 1 OR s.staff_only = 1 THEN 1 ELSE 0 END AS staffOnly
        FROM media m
        LEFT JOIN subcategories s ON s.image_media_id = m.id
        WHERE m.id = ?`,
