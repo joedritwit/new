@@ -1,4 +1,10 @@
-import { useEffect, useState, type FormEvent, type MouseEvent } from 'react'
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type FormEvent,
+  type MouseEvent,
+} from 'react'
 import { REPORT_REASONS } from '../shared/forum'
 import { fullDate, numberFormat } from './ui'
 import type {
@@ -10,7 +16,8 @@ import type {
   Viewer,
 } from '../shared/types'
 import { send } from './api'
-import { Composer } from './composer'
+import { PostEditor, quoteContent } from './editor'
+import { sanitizeRichHtml } from './rich-sanitize'
 import {
   Avatar,
   EmbedFrame,
@@ -199,6 +206,23 @@ function ReportForm({
   )
 }
 
+function PostBody({
+  post,
+  onClick,
+}: {
+  post: ThreadPost
+  onClick: (event: MouseEvent<HTMLDivElement>) => void
+}) {
+  const html = useMemo(() => sanitizeRichHtml(post.html), [post.html])
+  return (
+    <div
+      className="post-text"
+      onClick={onClick}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  )
+}
+
 export function ThreadView({
   data,
   viewer,
@@ -246,10 +270,6 @@ export function ThreadView({
     event.preventDefault()
     setSeek({ key: `${video.provider}:${video.id}`, start: Math.floor(start) })
   }
-
-  const quotePrefix = quote
-    ? `> ${quote.text.split('\n').join('\n> ')}\n\n`
-    : ''
 
   return (
     <article className="thread">
@@ -363,10 +383,9 @@ export function ThreadView({
                   />
                 )
               })}
-              <div
-                className="post-text"
+              <PostBody
+                post={post}
                 onClick={(event) => seekFromPost(event, post)}
-                dangerouslySetInnerHTML={{ __html: post.html }}
               />
               {reporting === post.id && (
                 <ReportForm postId={post.id} onDone={() => setReporting(null)} />
@@ -409,20 +428,24 @@ export function ThreadView({
                 </button>
               </p>
             )}
-            <Composer
+            <PostEditor
               key={quote?.id ?? 'reply'}
-              initialValue={quotePrefix}
+              header="Reply"
+              submitLabel="POST"
               placeholder="Add to the thread. Cite the statute, timestamp the clip, keep addresses out."
-              submitLabel="Post reply"
+              initialContent={quote ? quoteContent(quote.text) : undefined}
+              resetOnSuccess
               hint={
                 viewer.trustLevel === 0
                   ? 'New accounts cannot post links yet. Three posts and 24 hours unlock them.'
                   : undefined
               }
-              onSubmit={async (body) => {
-                await send(`/api/threads/${encodeURIComponent(thread.slug)}/posts`, 'POST', {
-                  body,
-                })
+              onSubmit={async (html) => {
+                await send(
+                  `/api/threads/${encodeURIComponent(thread.slug)}/posts`,
+                  'POST',
+                  { html },
+                )
                 setQuote(null)
                 onPosted()
               }}
