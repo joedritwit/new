@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import type {
   AdminBoards,
@@ -17,6 +17,7 @@ import type {
 import { AdminPage } from './admin'
 import { DonatePage } from './donate'
 import { FoiaPage } from './foia'
+import { DmcaPage, TermsPage } from './legal'
 import { ModQueuePage } from './mod'
 import { BoardIndexView, ThreadView } from './views'
 import { BoardView, NewThreadView, ProfilePage } from './pages'
@@ -41,15 +42,20 @@ function currentPath(): string {
 type Loadable<T> = {
   data: T | null
   error: string
+  code: string
   loading: boolean
   reload: () => void
 }
 
-/** Fetches JSON for a URL, and skips entirely when the URL is null. */
-function useJson<T>(url: string | null): Loadable<T> {
+/**
+ * Fetches JSON for a URL, and skips entirely when the URL is null. A Turnstile
+ * token is only passed for the session call that creates the account.
+ */
+function useJson<T>(url: string | null, turnstileToken = ''): Loadable<T> {
   const [state, setState] = useState<Omit<Loadable<T>, 'reload'>>({
     data: null,
     error: '',
+    code: '',
     loading: Boolean(url),
   })
   const [nonce, setNonce] = useState(0)
@@ -57,21 +63,34 @@ function useJson<T>(url: string | null): Loadable<T> {
 
   useEffect(() => {
     if (!url) {
-      setState({ data: null, error: '', loading: false })
+      setState({ data: null, error: '', code: '', loading: false })
       return
     }
     const controller = new AbortController()
-    setState({ data: null, error: '', loading: true })
+    setState({ data: null, error: '', code: '', loading: true })
     void (async () => {
       try {
-        const response = await fetch(url, { signal: controller.signal })
+        const response = await fetch(url, {
+          signal: controller.signal,
+          headers: turnstileToken
+            ? { 'X-Turnstile-Token': turnstileToken }
+            : undefined,
+        })
         const body = (await response.json().catch(() => null)) as
-          | (T & { error?: string })
+          | (T & { error?: string; code?: string })
           | null
-        if (!response.ok)
-          throw new Error(body?.error || 'The page could not be loaded.')
+        if (!response.ok) {
+          if (controller.signal.aborted) return
+          setState({
+            data: null,
+            error: body?.error || 'The page could not be loaded.',
+            code: body?.code ?? '',
+            loading: false,
+          })
+          return
+        }
         if (!body) throw new Error('The server returned an unexpected response.')
-        setState({ data: body, error: '', loading: false })
+        setState({ data: body, error: '', code: '', loading: false })
       } catch (error) {
         if (controller.signal.aborted) return
         setState({
@@ -80,14 +99,103 @@ function useJson<T>(url: string | null): Loadable<T> {
             error instanceof Error
               ? error.message
               : 'The page could not be loaded.',
+          code: '',
           loading: false,
         })
       }
     })()
     return () => controller.abort()
-  }, [url, nonce])
+  }, [url, nonce, turnstileToken])
 
   return { ...state, reload }
+}
+
+const TURNSTILE_SCRIPT =
+  'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
+
+type TurnstileApi = {
+  render: (container: HTMLElement, options: Record<string, unknown>) => string
+  remove: (widgetId: string) => void
+}
+
+declare global {
+  interface Window {
+    turnstile?: TurnstileApi
+  }
+}
+
+/**
+ * Shown only when the server asks for a verification token while creating the
+ * account. Tokens are single-use, so a failed check remounts the widget.
+ */
+function TurnstileGate({
+  siteKey,
+  failed,
+  onToken,
+}: {
+  siteKey: string
+  failed: boolean
+  onToken: (token: string) => void
+}) {
+  const holder = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!siteKey) return
+    let cancelled = false
+    let widgetId = ''
+    const render = () => {
+      if (cancelled || !holder.current || !window.turnstile) return
+      widgetId = window.turnstile.render(holder.current, {
+        sitekey: siteKey,
+        theme: 'dark',
+        callback: (token: string) => onToken(token),
+        'expired-callback': () => onToken(''),
+      })
+    }
+    const existing = document.querySelector<HTMLScriptElement>(
+      'script[data-turnstile]',
+    )
+    if (window.turnstile) {
+      render()
+    } else if (existing) {
+      existing.addEventListener('load', render)
+    } else {
+      const script = document.createElement('script')
+      script.src = TURNSTILE_SCRIPT
+      script.async = true
+      script.dataset.turnstile = 'true'
+      script.addEventListener('load', render)
+      document.head.appendChild(script)
+    }
+    return () => {
+      cancelled = true
+      existing?.removeEventListener('load', render)
+      if (widgetId && window.turnstile) window.turnstile.remove(widgetId)
+    }
+  }, [siteKey, onToken, failed])
+
+  return (
+    <section className="panel turnstile-gate" aria-live="polite">
+      <h2>One quick check</h2>
+      <p>
+        PublicLens uses Cloudflare Turnstile to keep automated sign-ups out.
+        Finish the check to create your account.
+      </p>
+      {failed && (
+        <p className="signin-note">
+          That check did not pass. Complete it again to continue.
+        </p>
+      )}
+      {siteKey ? (
+        <div ref={holder} />
+      ) : (
+        <p className="signin-note">
+          Verification is not configured for this build. Contact the site
+          owner.
+        </p>
+      )}
+    </section>
+  )
 }
 
 function Header({ session }: { session: Loadable<Session> }) {
@@ -163,6 +271,8 @@ type Route =
   | { name: 'thread'; slug: string }
   | { name: 'profile'; handle: string }
   | { name: 'foia' }
+  | { name: 'terms' }
+  | { name: 'dmca' }
   | { name: 'donate' }
   | { name: 'mod' }
   | { name: 'admin' }
@@ -171,6 +281,8 @@ type Route =
 function parseRoute(path: string): Route {
   if (path === '/') return { name: 'boards' }
   if (path === '/foia') return { name: 'foia' }
+  if (path === '/terms') return { name: 'terms' }
+  if (path === '/dmca') return { name: 'dmca' }
   if (path === '/donate') return { name: 'donate' }
   if (path === '/mod') return { name: 'mod' }
   if (path === '/admin') return { name: 'admin' }
@@ -193,7 +305,11 @@ function parseRoute(path: string): Route {
 function App() {
   const path = usePathname()
   const route = parseRoute(path)
-  const session = useJson<Session>('/api/session')
+  const [turnstileToken, setTurnstileToken] = useState('')
+  const handleTurnstileToken = useCallback((token: string) => {
+    setTurnstileToken(token)
+  }, [])
+  const session = useJson<Session>('/api/session', turnstileToken)
 
   const boards = useJson<BoardIndex>(
     route.name === 'boards' ? '/api/boards' : null,
@@ -280,6 +396,10 @@ function App() {
     ) : null
   } else if (route.name === 'foia') {
     content = <FoiaPage />
+  } else if (route.name === 'terms') {
+    content = <TermsPage />
+  } else if (route.name === 'dmca') {
+    content = <DmcaPage />
   } else if (route.name === 'donate') {
     content = donations.loading ? (
       <Loading />
@@ -352,11 +472,27 @@ function App() {
   return (
     <div className="shell">
       <Header session={session} />
-      <main className="main">{content}</main>
+      <main className="main">
+        {session.code.startsWith('turnstile_') && (
+          <TurnstileGate
+            siteKey={String(
+              import.meta.env.VITE_TURNSTILE_SITE_KEY ?? '',
+            )}
+            failed={session.code === 'turnstile_failed'}
+            onToken={handleTurnstileToken}
+          />
+        )}
+        {content}
+      </main>
       <footer className="footer">
         <span>PublicLens</span>
         <span aria-hidden="true" className="dot" />
         <span>Document the encounter. Cite the law. Strip the metadata.</span>
+        <span aria-hidden="true" className="dot" />
+        <nav className="footer-links" aria-label="Legal">
+          <Link href="/terms">Terms</Link>
+          <Link href="/dmca">DMCA</Link>
+        </nav>
       </footer>
     </div>
   )

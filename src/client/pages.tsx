@@ -12,8 +12,8 @@ import type {
   Viewer,
 } from '../shared/types'
 import { navigate, send } from './api'
-import { Composer } from './composer'
-import { AttachImage, ImagePicker } from './media'
+import { PostEditor } from './editor'
+import { ImagePicker } from './media'
 import {
   Avatar,
   Link,
@@ -129,9 +129,6 @@ export function NewThreadView({
 }) {
   const [title, setTitle] = useState('')
   const [prefix, setPrefix] = useState('')
-  const [body, setBody] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
 
   if (!viewer) {
     return (
@@ -142,107 +139,65 @@ export function NewThreadView({
     )
   }
 
-  async function submit(event: FormEvent) {
-    event.preventDefault()
-    if (busy) return
-    setBusy(true)
-    setError('')
-    try {
-      const result = await send<{ slug: string }>('/api/threads', 'POST', {
-        boardId: data.board.id,
-        title: title.trim(),
-        prefix: prefix || null,
-        body,
-      })
-      navigate(`/t/${result.slug}`)
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Could not post.')
-      setBusy(false)
-    }
-  }
-
   return (
     <>
       <BackToBoard board={data.board} />
-      <form className="composer" onSubmit={submit}>
-        <h1 className="form-title">New thread in {data.board.name}</h1>
-        <div className="field">
-          <label className="field-label" htmlFor="thread-title">
-            Title
-          </label>
-          <input
-            id="thread-title"
-            className="input"
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            minLength={LIMITS.titleMin}
-            maxLength={LIMITS.titleMax}
-            required
-            placeholder="What happened, in one line"
-          />
-        </div>
-        <div className="field">
-          <label className="field-label" htmlFor="thread-prefix">
-            Prefix
-          </label>
-          <select
-            id="thread-prefix"
-            className="select"
-            value={prefix}
-            onChange={(event) => setPrefix(event.target.value)}
-          >
-            <option value="">No prefix</option>
-            {THREAD_PREFIXES.map((value) => (
-              <option key={value} value={value}>
-                {value}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="field">
-          <label className="field-label" htmlFor="thread-body">
-            Post
-          </label>
-          <textarea
-            id="thread-body"
-            className="textarea"
-            value={body}
-            onChange={(event) => setBody(event.target.value)}
-            minLength={1}
-            maxLength={LIMITS.bodyMax}
-            required
-            placeholder="What happened, what you tried, and what you would do differently. Markdown and YouTube, Rumble, Vimeo, PeerTube, or Archive.org links are supported. Timestamps like 12:34 become seek links."
-          />
-        </div>
-        {viewer.trustLevel === 0 && (
-          <p className="hint">
-            New accounts cannot post links yet. Three posts and 24 hours unlock
-            them.
-          </p>
-        )}
-        {error && (
-          <p className="form-error" role="alert">
-            {error}
-          </p>
-        )}
-        <div className="composer-foot">
-          <div className="composer-tools">
-            <AttachImage
-              disabled={busy}
-              onInsert={(markdown) => setBody((current) => `${current}${markdown}`)}
-            />
-            <Link className="button ghost" href={`/b/${data.board.id}`}>
-              Cancel
-            </Link>
+      <PostEditor
+        header="Create New Thread"
+        submitLabel="POST"
+        placeholder="What happened, what you tried, and what you would do differently. Images, formatting, and YouTube, Rumble, Vimeo, PeerTube, or Archive.org links are supported. Timestamps like 12:34 become seek links."
+        meta={
+          <div className="wysiwyg-meta">
+            <div className="wysiwyg-title-row">
+              <input
+                id="thread-title"
+                className="wysiwyg-title"
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                minLength={LIMITS.titleMin}
+                maxLength={LIMITS.titleMax}
+                required
+                placeholder="Thread Title"
+                aria-label="Thread title"
+              />
+              <select
+                id="thread-prefix"
+                className="wysiwyg-prefix"
+                value={prefix}
+                onChange={(event) => setPrefix(event.target.value)}
+                aria-label="Thread prefix"
+              >
+                <option value="">No prefix</option>
+                {THREAD_PREFIXES.map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
-          <button
-            className="button"
-            disabled={busy || !title.trim() || !body.trim()}
-          >
-            {busy ? 'Posting…' : 'Post thread'}
-          </button>
-        </div>
-      </form>
+        }
+        headAction={
+          <Link className="quiet-link" href={`/b/${data.board.id}`}>
+            Cancel
+          </Link>
+        }
+        canSubmit={title.trim().length >= LIMITS.titleMin}
+        hint={
+          viewer.trustLevel === 0
+            ? 'New accounts cannot post links yet. Three posts and 24 hours unlock them.'
+            : undefined
+        }
+        onSubmit={async (html) => {
+          const result = await send<{ slug: string }>('/api/threads', 'POST', {
+            boardId: data.board.id,
+            title: title.trim(),
+            prefix: prefix || null,
+            html,
+          })
+          navigate(`/t/${result.slug}`)
+        }}
+      />
     </>
   )
 }
