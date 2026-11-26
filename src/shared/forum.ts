@@ -39,6 +39,7 @@ export const LIMITS = {
   titleMin: 4,
   titleMax: 120,
   bodyMax: 10_000,
+  bodyHtmlMax: 200_000,
   displayNameMin: 2,
   displayNameMax: 40,
   bioMax: 280,

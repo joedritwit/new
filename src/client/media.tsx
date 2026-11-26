@@ -134,19 +134,3 @@ export function ImagePicker({
   )
 }
 
-export function AttachImage({
-  onInsert,
-  disabled,
-}: {
-  onInsert: (markdown: string) => void
-  disabled?: boolean
-}) {
-  return (
-    <ImagePicker
-      label="Attach image"
-      kind="post_image"
-      disabled={disabled}
-      onUploaded={(media) => onInsert(`\n\n![image](${media.url})\n`)}
-    />
-  )
-}
