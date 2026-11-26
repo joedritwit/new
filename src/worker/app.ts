@@ -61,7 +61,9 @@ import {
   type ReportAction,
 } from './moderation'
 import { createReply, createThread, isThreadPrefix } from './mutations'
+import { sanitizeRichHtml } from './richtext'
 import { atLeast, canReadRestricted, isStaff } from './roles'
+import { verifyTurnstileToken, type TurnstileVerifier } from './turnstile'
 import { updateProfile, viewerDto, viewerFor, type ViewerProfile } from './users'
 
 type AppContext = { Bindings: Env }
@@ -92,7 +94,10 @@ function readObject(
 }
 
 /** Tests inject identities; production always uses the Freebuff SDK. */
-export function createApp(authenticate: Authenticate = currentUser) {
+export function createApp(
+  authenticate: Authenticate = currentUser,
+  verifyTurnstile: TurnstileVerifier = verifyTurnstileToken,
+) {
   const app = new Hono<AppContext>()
 
   app.get('/api/health', (c) => c.json({ ok: true }))
@@ -107,13 +112,66 @@ export function createApp(authenticate: Authenticate = currentUser) {
     maxSize: 32 * 1024,
     onError: (c) => c.json({ error: 'Request is too large.' }, 413),
   })
+  // Rich editor HTML gets its own ceiling. The derived plain text is still
+  // capped by LIMITS.bodyMax inside the mutation.
+  const richLimit = bodyLimit({
+    maxSize: 512 * 1024,
+    onError: (c) => c.json({ error: 'Request is too large.' }, 413),
+  })
+  const isRichPost = (c: Context<AppContext>) =>
+    c.req.method === 'POST' &&
+    (c.req.path === '/api/threads' ||
+      /^\/api\/threads\/[^/]+\/posts$/.test(c.req.path))
   app.use('/api/*', async (c, next) => {
-    if (c.req.path === '/api/uploads') return next()
+    if (c.req.path === '/api/uploads' || isRichPost(c)) return next()
     return jsonLimit(c, next)
   })
 
   const demoAdmin = (c: Context<AppContext>) =>
     isLocalPreview(c.req.raw, c.env)
+
+  type RegistrationCheck =
+    | { ok: true }
+    | { ok: false; code: string; error: string }
+
+  /**
+   * The first authenticated request provisions the local account row. When a
+   * Turnstile secret is configured that creation needs a token from the
+   * widget; an account that already exists is never challenged again.
+   */
+  async function registrationCheck(
+    c: Context<AppContext>,
+    sub: string,
+  ): Promise<RegistrationCheck> {
+    if (!c.env.DB || !c.env.TURNSTILE_SECRET_KEY) return { ok: true }
+    const known = await c.env.DB.prepare(
+      'SELECT 1 AS found FROM users WHERE id = ?',
+    )
+      .bind(sub)
+      .first()
+    if (known) return { ok: true }
+
+    const token = c.req.header('X-Turnstile-Token')?.trim()
+    if (!token)
+      return {
+        ok: false,
+        code: 'turnstile_required',
+        error: 'Complete the verification check to finish creating your account.',
+      }
+
+    const passed = await verifyTurnstile(
+      c.env,
+      token,
+      c.req.header('CF-Connecting-IP') ?? null,
+    )
+    return passed
+      ? { ok: true }
+      : {
+          ok: false,
+          code: 'turnstile_failed',
+          error: 'That verification did not pass. Reload and try again.',
+        }
+  }
 
   async function readViewer(
     c: Context<AppContext>,
@@ -121,6 +179,9 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const user = await authenticate(c.req.raw, c.env)
     if (!user || !c.env.DB) return null
     await ensureDatabase(c.env.DB)
+    // An unverified first sign-in reads as a guest instead of provisioning.
+    const registration = await registrationCheck(c, user.sub)
+    if (!registration.ok) return null
     return viewerFor(c.env.DB, user, { promoteToAdmin: demoAdmin(c) })
   }
 
@@ -144,6 +205,9 @@ export function createApp(authenticate: Authenticate = currentUser) {
         return c.json({ error: 'Cross-origin request refused.' }, 403)
     }
     await ensureDatabase(c.env.DB)
+    const registration = await registrationCheck(c, user.sub)
+    if (!registration.ok)
+      return c.json({ error: registration.error, code: registration.code }, 403)
     const profile = await viewerFor(c.env.DB, user, {
       promoteToAdmin: demoAdmin(c),
     })
@@ -157,6 +221,12 @@ export function createApp(authenticate: Authenticate = currentUser) {
     let viewer: Viewer | null = null
     if (auth && c.env.DB) {
       await ensureDatabase(c.env.DB)
+      const registration = await registrationCheck(c, auth.sub)
+      if (!registration.ok)
+        return c.json(
+          { error: registration.error, code: registration.code },
+          403,
+        )
       const profile = await viewerFor(c.env.DB, auth, {
         promoteToAdmin: demoAdmin(c),
       })
@@ -326,53 +396,103 @@ export function createApp(authenticate: Authenticate = currentUser) {
       : c.json({ error: 'That member does not exist.' }, 404)
   })
 
-  app.post('/api/threads', async (c) => {
+  app.post('/api/threads', richLimit, async (c) => {
     const guard = await authorise(c)
     if (guard instanceof Response) return guard
 
-    const body = readObject(await c.req.json().catch(() => null), [
+    const input = readObject(await c.req.json().catch(() => null), [
       'boardId',
       'title',
       'body',
+      'html',
       'prefix',
     ])
-    if (!body) return c.json({ error: 'Invalid request.' }, 400)
+    if (!input) return c.json({ error: 'Invalid request.' }, 400)
+    const hasBody = typeof input.body === 'string'
+    const hasHtml = typeof input.html === 'string'
     if (
-      typeof body.boardId !== 'string' ||
-      typeof body.title !== 'string' ||
-      typeof body.body !== 'string'
+      typeof input.boardId !== 'string' ||
+      typeof input.title !== 'string' ||
+      hasBody === hasHtml
     )
       return c.json({ error: 'A board, title, and body are required.' }, 400)
     if (
-      body.prefix !== null &&
-      body.prefix !== undefined &&
-      (typeof body.prefix !== 'string' || !isThreadPrefix(body.prefix))
+      input.prefix !== null &&
+      input.prefix !== undefined &&
+      (typeof input.prefix !== 'string' || !isThreadPrefix(input.prefix))
     )
       return c.json({ error: 'That prefix is not available.' }, 400)
 
+    let body = hasBody ? (input.body as string) : ''
+    let bodyHtml: string | undefined
+    if (hasHtml) {
+      const raw = input.html as string
+      if (raw.length > LIMITS.bodyHtmlMax)
+        return c.json(
+          { error: `Formatted posts are limited to ${LIMITS.bodyHtmlMax} characters.` },
+          400,
+        )
+      try {
+        const rich = sanitizeRichHtml(raw)
+        body = rich.text
+        bodyHtml = rich.html
+      } catch {
+        return c.json({ error: 'That post could not be processed.' }, 400)
+      }
+    }
+    if (!body.trim())
+      return c.json({ error: 'Write something before posting.' }, 400)
+
     const result = await createThread(c.env.DB!, guard.profile, {
-      boardId: body.boardId,
-      title: body.title,
-      body: body.body,
-      prefix: typeof body.prefix === 'string' ? body.prefix : null,
+      boardId: input.boardId,
+      title: input.title,
+      body,
+      bodyHtml,
+      prefix: typeof input.prefix === 'string' ? input.prefix : null,
     })
     if (!result.ok) return c.json({ error: result.error }, result.status)
     return c.json({ slug: result.value.slug }, 201)
   })
 
-  app.post('/api/threads/:slug/posts', async (c) => {
+  app.post('/api/threads/:slug/posts', richLimit, async (c) => {
     const guard = await authorise(c)
     if (guard instanceof Response) return guard
 
-    const body = readObject(await c.req.json().catch(() => null), ['body'])
-    if (!body || typeof body.body !== 'string')
+    const input = readObject(await c.req.json().catch(() => null), [
+      'body',
+      'html',
+    ])
+    const hasBody = typeof input?.body === 'string'
+    const hasHtml = typeof input?.html === 'string'
+    if (!input || hasBody === hasHtml)
+      return c.json({ error: 'Write something before posting.' }, 400)
+
+    let body = hasBody ? (input.body as string) : ''
+    let bodyHtml: string | undefined
+    if (hasHtml) {
+      const raw = input.html as string
+      if (raw.length > LIMITS.bodyHtmlMax)
+        return c.json(
+          { error: `Formatted posts are limited to ${LIMITS.bodyHtmlMax} characters.` },
+          400,
+        )
+      try {
+        const rich = sanitizeRichHtml(raw)
+        body = rich.text
+        bodyHtml = rich.html
+      } catch {
+        return c.json({ error: 'That post could not be processed.' }, 400)
+      }
+    }
+    if (!body.trim())
       return c.json({ error: 'Write something before posting.' }, 400)
 
     const result = await createReply(
       c.env.DB!,
       guard.profile,
       c.req.param('slug'),
-      body.body,
+      body,
+      bodyHtml,
       c.env,
     )
     if (!result.ok) return c.json({ error: result.error }, result.status)
