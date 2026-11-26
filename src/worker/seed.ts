@@ -10,8 +10,9 @@
 const MINUTE = 60_000
 const HOUR = 60
 const DAY = 24 * HOUR
-const now = Date.now()
-const ago = (minutes: number) => now - minutes * MINUTE
+// A Worker's module scope evaluates with a zero clock, so callers pass the
+// request-time value instead of reading Date.now() at import time.
+const ago = (at: number, minutes: number) => at - minutes * MINUTE
 
 type StaffRole = 'member' | 'supporter' | 'moderator' | 'admin'
 
@@ -207,6 +208,22 @@ const CATEGORIES: SeedCategory[] = [
   },
 ]
 
+const BOARD_OPEN_TITLE =
+  'The boards are open: accounts, posting, reports, and media are live'
+const BOARD_OPEN_BODY = `PublicLens is fully open. Sign in with Freebuff to post, reply, report, and set up a profile. Supporters and staff can read the Supporters area; moderators work reports at /mod, and admins manage the board tree, donations, and Supporter grants at /admin.
+
+A few things worth knowing before your first post. Images are re-encoded in the browser and stripped of metadata on the server before they are stored, so publish a cleaned copy and keep the original offline. Posts containing addresses, phone numbers, or SSNs are held for staff review rather than published. Reports go to the queue once per member per post, and three active warning points bring a 24-hour mute.
+
+A reminder while it is quiet: this forum exists to make audits safer to record and easier to understand. That means citations over vibes, and no addresses.`
+
+const METADATA_BODY = `Phone footage carries more than an image. Depending on the app and the container, a photo or video can carry GPS coordinates, device model and serial number, and creation timestamps precise enough to place you at a location.
+
+Uploading that to a public forum is a doxxing vector that has nothing to do with your face. The fix is unglamorous: strip metadata before the file leaves your device, and strip it again on the server.
+
+PublicLens does both. The browser re-encodes avatars, board banners, and post images through a canvas, then the Worker rewrites the JPEG, PNG, or WebP container to drop EXIF, GPS, XMP, ICC, and text chunks. The original is never stored: R2 only ever holds the stripped copy. Video files are not accepted — paste an allowlisted provider link instead.`
+
+const RETIRED_THREADS = ['th:mic-wind', 'th:streaming']
+
 type SeedPost = { authorId: string; body: string; minutesAgo: number }
 
 type SeedThread = {
@@ -228,18 +245,14 @@ const THREADS: SeedThread[] = [
     subcategoryId: 'announcements',
     authorId: 'seed:redline',
     slug: 'boards-are-open',
-    title: 'The boards are open for reading',
+    title: BOARD_OPEN_TITLE,
     prefix: 'NOTICE',
     isPinned: true,
     posts: [
       {
         authorId: 'seed:redline',
         minutesAgo: 2 * DAY,
-        body: `The board index and thread reading are live. Accounts, posting, and the report queue land next, in that order.
-
-Until posting opens, threads are read-only. If a citation in a thread is wrong, or a board description reads badly, keep a note of it — there will be a report button soon enough.
-
-A reminder while it is quiet: this forum exists to make audits safer to record and easier to understand. That means citations over vibes, and no addresses.`,
+        body: BOARD_OPEN_BODY,
       },
     ],
   },
@@ -544,73 +557,6 @@ What survives in every circuit: recording officials performing their duties in a
     ],
   },
   {
-    id: 'th:mic-wind',
-    subcategoryId: 'audio',
-    authorId: 'seed:ferrite',
-    slug: 'concealed-mic-windbreaker',
-    title: 'A concealed mic that survives a windbreaker, for under a hundred dollars',
-    prefix: 'GEAR',
-    tags: ['gear'],
-    posts: [
-      {
-        authorId: 'seed:ferrite',
-        minutesAgo: 12 * DAY,
-        body: `Three things break a concealed audio setup: wind, cloth rustle, and a cable that has to bend around a body that keeps moving.
-
-Wind is a foam problem before it is a software problem. Two layers of open-cell foam with an air gap beats one dense windscreen. Cloth rustle is a mounting problem: a lav taped flat to a shirt transmits every fold. Mount it with a small loop of tape so the capsule floats.
-
-The cable is where cheap setups fail. A right-angle connector at the recorder, a strain relief loop, and never a cable that runs straight down a seam.
-
-This is not a brand recommendation. It is the shape of a setup that survived eight hours outdoors in a jacket.`,
-      },
-      {
-        authorId: 'seed:quietcarry',
-        minutesAgo: 10 * DAY + 4 * HOUR,
-        body: `The tape loop is the whole trick and it took me two years to learn it.`,
-      },
-      {
-        authorId: 'seed:ferrite',
-        minutesAgo: 10 * DAY + 2 * HOUR,
-        body: `Two years and one ruined recording where I could not hear a single word the officer said. Learn from my expensive silence.`,
-      },
-    ],
-  },
-  {
-    id: 'th:streaming',
-    subcategoryId: 'streaming',
-    authorId: 'seed:ferrite',
-    slug: 'redundant-cellular-streaming-workflow',
-    title: 'Redundant cellular plus local recording: my streaming workflow and its failure modes',
-    prefix: 'LIVE',
-    tags: ['gear'],
-    posts: [
-      {
-        authorId: 'seed:ferrite',
-        minutesAgo: 15 * DAY,
-        body: `Live is a backup, not the evidence. The local recording is the evidence.
-
-I run two cellular links bonded at the backpack, a local recorder on the main camera, and a second audio track on the phone. If the bond drops, the stream degrades and the local files do not care. That ordering matters when someone asks for the unedited version.
-
-Failure modes I have actually hit: thermal throttling in direct sun at about forty minutes, a provider-side NAT change that killed the RTMP session mid-encounter, and a battery bank that decided ninety degrees Fahrenheit was too warm to charge. Every one of those was survivable because the local file existed.`,
-      },
-      {
-        authorId: 'seed:margin',
-        minutesAgo: 14 * DAY + 6 * HOUR,
-        body: `Thermal is the one nobody plans for. A white shell and a shade card are cheaper than a better encoder.`,
-      },
-      {
-        authorId: 'seed:onlooker',
-        minutesAgo: 13 * DAY + 8 * HOUR,
-        body: `Do you publish the local file unedited, or the stream capture?`,
-      },
-      {
-        authorId: 'seed:ferrite',
-        minutesAgo: 13 * DAY + 7 * HOUR,
-        body: `Local file, always. Stream capture is a convenience for clips. The file is what you would hand to a lawyer.`,
-      },
-    ],
-  },
-  {
     id: 'th:metadata',
     subcategoryId: 'privacy',
     authorId: 'seed:redline',
@@ -623,11 +569,7 @@ Failure modes I have actually hit: thermal throttling in direct sun at about for
       {
         authorId: 'seed:redline',
         minutesAgo: 18 * DAY,
-        body: `Phone footage carries more than an image. Depending on the app and the container, a photo or video can carry GPS coordinates, device model and serial number, and creation timestamps precise enough to place you at a location.
-
-Uploading that to a public forum is a doxxing vector that has nothing to do with your face. The fix is unglamorous: strip metadata before the file leaves your device, and strip it again on the server if you run the platform.
-
-PublicLens will run uploads through a metadata-stripping step that removes EXIF and GPS segments before anything is stored. Until that ships, assume any image you post keeps whatever your camera wrote into it.`,
+        body: METADATA_BODY,
       },
       {
         authorId: 'seed:lex',
@@ -685,6 +627,8 @@ const TAGS: { id: string; name: string; slug: string }[] = [
 ]
 
 const SEED_MARKER = 'seed:v1'
+const SEED_V2_MARKER = 'seed:v2'
+const SEED_V3_MARKER = 'seed:v3'
 
 async function runInChunks(
   db: D1Database,
@@ -697,11 +641,17 @@ async function runInChunks(
 }
 
 export async function seedDatabase(db: D1Database): Promise<void> {
-  const marker = await db
+  const seeded = await db
     .prepare('SELECT value FROM app_meta WHERE key = ?')
     .bind(SEED_MARKER)
     .first<{ value: string }>()
-  if (marker) return
+  if (!seeded) await seedV1(db)
+  await seedV2(db)
+  await seedV3(db)
+}
+
+async function seedV1(db: D1Database): Promise<void> {
+  const at = Date.now()
 
   // Only seed-owned rows are cleared; this runs before any user content exists.
   await db.batch([
@@ -732,7 +682,7 @@ export async function seedDatabase(db: D1Database): Promise<void> {
           user.staffRole,
           user.roleTag,
           user.avatarColor,
-          ago(user.joinedDaysAgo * DAY),
+          ago(at, user.joinedDaysAgo * DAY),
         ),
     )
   }
@@ -784,8 +734,8 @@ export async function seedDatabase(db: D1Database): Promise<void> {
           thread.prefix,
           thread.isPinned ? 1 : 0,
           thread.isLocked ? 1 : 0,
-          ago(first.minutesAgo),
-          ago(last.minutesAgo),
+          ago(at, first.minutesAgo),
+          ago(at, last.minutesAgo),
         ),
     )
     thread.posts.forEach((post, position) => {
@@ -801,7 +751,7 @@ export async function seedDatabase(db: D1Database): Promise<void> {
             post.authorId,
             post.body,
             position,
-            ago(post.minutesAgo),
+            ago(at, post.minutesAgo),
           ),
       )
     })
@@ -833,6 +783,104 @@ export async function seedDatabase(db: D1Database): Promise<void> {
       `INSERT INTO app_meta (key, value) VALUES (?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
     )
-    .bind(SEED_MARKER, String(now))
+    .bind(SEED_MARKER, String(at))
+    .run()
+}
+
+/**
+ * v2 refresh for databases that already hold the v1 seed: retire two gear
+ * threads (12 remain) and fix copy that described unshipped features. The
+ * marker makes it idempotent, and a retired thread is kept when a member has
+ * replied so real discussion is never deleted.
+ */
+async function seedV2(db: D1Database): Promise<void> {
+  const applied = await db
+    .prepare('SELECT value FROM app_meta WHERE key = ?')
+    .bind(SEED_V2_MARKER)
+    .first<{ value: string }>()
+  if (applied) return
+
+  await db.batch([
+    db
+      .prepare('UPDATE threads SET title = ? WHERE id = ?')
+      .bind(BOARD_OPEN_TITLE, 'th:board-open'),
+    db
+      .prepare('UPDATE posts SET body = ? WHERE id = ?')
+      .bind(BOARD_OPEN_BODY, 'th:board-open:p0'),
+    db
+      .prepare('UPDATE posts SET body = ? WHERE id = ?')
+      .bind(METADATA_BODY, 'th:metadata:p0'),
+  ])
+
+  for (const threadId of RETIRED_THREADS) {
+    const reply = await db
+      .prepare(
+        `SELECT 1 AS found FROM posts
+         WHERE thread_id = ? AND id NOT LIKE 'th:%' LIMIT 1`,
+      )
+      .bind(threadId)
+      .first()
+    if (reply) continue
+    await db.batch([
+      db.prepare('DELETE FROM thread_tags WHERE thread_id = ?').bind(threadId),
+      db.prepare('DELETE FROM posts WHERE thread_id = ?').bind(threadId),
+      db.prepare('DELETE FROM threads WHERE id = ?').bind(threadId),
+    ])
+  }
+
+  await db
+    .prepare(
+      `INSERT INTO app_meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    )
+    .bind(SEED_V2_MARKER, String(Date.now()))
+    .run()
+}
+
+/**
+ * v3 repair: earlier seeds read the clock at module scope, where a Worker
+ * evaluates with time 0, so their timestamps were stored as `0 - offset`.
+ * Adding the request clock once restores the intended relative times. The
+ * `< 0` guards make a repaired row stable, and a thread whose activity came
+ * from a real reply keeps its positive timestamp.
+ */
+async function seedV3(db: D1Database): Promise<void> {
+  const applied = await db
+    .prepare('SELECT value FROM app_meta WHERE key = ?')
+    .bind(SEED_V3_MARKER)
+    .first<{ value: string }>()
+  if (applied) return
+
+  const shift = Date.now()
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE users SET joined_at = joined_at + ?
+         WHERE id LIKE 'seed:%' AND joined_at < 0`,
+      )
+      .bind(shift),
+    db
+      .prepare(
+        `UPDATE threads
+         SET created_at = created_at + ?,
+             last_activity_at = CASE WHEN last_activity_at < 0
+               THEN last_activity_at + ? ELSE last_activity_at END
+         WHERE id LIKE 'th:%' AND created_at < 0`,
+      )
+      .bind(shift, shift),
+    db
+      .prepare(
+        `UPDATE posts SET created_at = created_at + ?
+         WHERE id LIKE 'th:%' AND created_at < 0`,
+      )
+      .bind(shift),
+  ])
+
+  await db
+    .prepare(
+      `INSERT INTO app_meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    )
+    .bind(SEED_V3_MARKER, String(Date.now()))
     .run()
 }
