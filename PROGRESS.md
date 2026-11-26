@@ -1,10 +1,12 @@
 # PublicLens Progress
 
-Last updated: 2026-11-25
+Last updated: 2026-11-26
 
 - Branch: `freebuff/546322336542980ac576b88b`
 - Site: `a3ead2fc-9fa7-426d-af34-eb9a489d93dc` (Freebuff Sites)
-- Preview: <https://publiclens-wxpb0d-preview.freebuff.site> — published, serving M4
+- Preview: <https://publiclens-wxpb0d-preview.freebuff.site> — published, serving M5
+  plus the Markdown posting editor (deployed 2026-11-26T00:35:49Z); the rich
+  editor is local and has not been deployed
 - Production: <https://publiclens-wxpb0d.freebuff.site> — not published
 - Repository: all PublicLens files are currently untracked; no project commit yet
 
@@ -16,16 +18,20 @@ Scope source of truth: `PROJECT_SPEC.md`. Agent rules: `AGENTS.md`.
 | --- | --- |
 | M0 foundation | Complete |
 | M1 accounts, profiles, posting | Complete |
+| M1.5 search, reactions, bookmarks, quote storage | Not built (not a launch blocker) |
 | M2 moderation and admin | Complete |
 | M3 media, FOIA, notifications | Complete |
 | M4 donations and Supporters | Complete |
-| M5 hardening and launch | Planned, not implemented |
-| Preview deployment | M4 live; M5 not deployed |
+| M5 hardening and launch | Code complete: leaks, guards, Turnstile, legal pages, seed v2 |
+| Posting editor | Complete: TipTap rich text, popovers, two sanitizer passes, tests |
+| Preview deployment | M5 + Markdown editor live; rich editor local, not deployed |
 | Production deployment | Not requested, not published |
 
-Last full verification (M4): client `tsc --noEmit`, worker
-`tsc --noEmit -p tsconfig.worker.json`, `bun test` (27 passed, 0 failed), and
-`bun run build` all passed. No failing checks are known as of that verification.
+Last full verification (rich-text editor): client `tsc --noEmit`, worker
+`tsc --noEmit -p tsconfig.worker.json`, `bun test` (40 passed, 0 failed), and
+`bun run build` all passed. The editor was also loaded in the local signed-in
+preview at desktop and 390 px, including a simulated 420 px keyboard viewport;
+no console errors and no toolbar overflow were observed.
 
 ## Completed
 
@@ -71,75 +77,108 @@ Last full verification (M4): client `tsc --noEmit`, worker
 - Audit entries and in-app notifications for grants/revocations.
 - Fixed: non-Supporters no longer send `showSupporterBadge` on profile save.
 
+### M5 — hardening (code complete)
+1. **Staff-only profile excerpts fixed.** `getProfile` in `src/worker/db.ts`
+   joins `subcategories` and binds the viewer's read role, so recent-post
+   excerpts and titles from staff-only boards are hidden below Supporter.
+2. **Staff-only post images fixed.** Migration 6 adds
+   `media.staff_only INTEGER NOT NULL DEFAULT 0`. Images referenced from a
+   staff-only board, and banners on staff-only boards, return 404 to anyone
+   below Supporter; public images stay public. Flags rise when a post is created
+   in a staff-only board, when an admin seals a board, and when a banner is
+   attached.
+3. **Moderation staff/self guards.** Nobody warns or revokes a warning on
+   themselves; only admins act on staff accounts, posts, or threads; nobody
+   handles a report they filed or a report about their own post.
+4. **Turnstile registration gate.** The first authenticated request provisions
+   an account only with a verified `X-Turnstile-Token` when
+   `TURNSTILE_SECRET_KEY` is set; existing accounts and unconfigured builds are
+   unaffected. The SPA renders the dark widget from
+   `VITE_TURNSTILE_SITE_KEY` and retries `/api/session` with the token.
+5. **Legal pages.** `/terms` and `/dmca` with footer links. The DMCA agent block
+   is a clearly marked placeholder (name, email, postal address).
+6. **Seed v2.** Idempotent `seed:v2` marker retires two extra gear threads
+   (12 remain) and refreshes the stale pinned notice and metadata thread copy
+   for databases that already hold `seed:v1`. A retired thread is kept if a
+   member replied, so user content is never deleted.
+7. **Seed clock repaired.** Worker module scope evaluates with time 0, so the
+   v1/v2 seed wrote negative (`0 - offset`) timestamps. `seedV1` now reads the
+   clock per request, and the idempotent `seed:v3` marker shifts existing
+   seed-owned user, thread, and post timestamps by the request clock. Positive
+   activity from a real reply is left alone. A regression test seeds a
+   zero-clock database, runs the repair, and checks the shift and idempotency.
+8. **Mobile header and notifications.** On screens up to 640 px the account
+   cluster (bell, avatar, sign out) is pushed to the right corner, and the
+   notification panel is anchored below the full two-row header instead of to
+   the bell, so it no longer covers the nav or runs off-screen.
+
+### Rich-text posting editor
+- New posts use TipTap 3: bold, italic, underline, strikethrough, a 16-colour
+  teardrop palette, seven font sizes, blockquote, alignment, lists, links,
+  local images, emoji, code blocks, and undo.
+- New threads use the “Create New Thread” panel with a recessed Thread Title,
+  prefix picker, black canvas, beveled POST button, and the icon toolbar;
+  replies reuse the same panel and quote into a TipTap blockquote.
+- The browser filters saved HTML with DOMPurify. The Worker re-parses it with
+  `rehype-sanitize`, maps colour/size/alignment styles to `.tx-*`, `.fs-*`, and
+  `.align-*` classes, restricts images to `/api/files/<uuid>`, and stores the
+  canonical HTML in `posts.body_html`. `posts.body` is derived plain text.
+- Legacy Markdown rows keep `body_html = NULL` and still render through the
+  old sanitised Markdown path. The client render pass allows both rich and
+  legacy formatting classes.
+- Migration 7 adds `posts.body_html`; rich JSON writes have a 512 KB transport
+  ceiling but the plain-text limit remains 10,000 characters.
+- Poll/Embed deliberately inserts an external URL. Known video/poll links use
+  the existing embed descriptors; native in-app polling is still out of scope.
+
+Regression tests cover the two leaks, the moderation boundaries, the Turnstile
+gate, the seed counts, the seed-clock repair, rich-HTML class mapping, script
+and URL stripping, derived plain text, rich link gating, and the legacy
+Markdown path.
+
 ## Broken, risky, or in progress
 
-### M5 — hardening and launch (not started)
-
-No M5 code has been written yet. The following are code-review findings from the
-current source; they are not yet fixed.
-
-1. **Staff-only profile excerpts can leak.**
-   `getProfile` in `src/worker/db.ts` builds the latest-posts list with
-   `posts` → `threads` but does not join `subcategories` or filter
-   `staff_only`. A public profile can therefore show excerpts and thread titles
-   from staff-only boards. Expected: only Supporters, moderators, and admins.
-2. **Staff-only post images are publicly fetchable.**
-   `media` has no `staff_only` column; `mediaForFile` only derives restricted
-   access for board banners. An image referenced in a staff-only thread can be
-   fetched by UUID without a session. Expected: gate post media by its
-   staff-only board, and mark media when a board becomes staff-only.
-3. **Moderation staff/self boundaries are incomplete.**
-   `issueWarning` only blocks a non-admin from warning an admin, so a moderator
-   can warn themselves or another moderator. `revokeWarning` has no self/staff
-   check. `applyReportAction` lets a moderator remove or lock content authored
-   by staff, or handle a report they filed themselves. Expected: no
-   self-moderation, and only admins act on staff accounts/content.
-4. **Turnstile is not implemented.**
-   `TURNSTILE_SECRET_KEY` and `VITE_TURNSTILE_SITE_KEY` exist only as
-   `.env.example` placeholders. Registration still provisions a local account
-   on the first authenticated request. The preview environment has no custom
-   variables set (0 of 25).
-5. **No Terms or DMCA pages.**
-   `/terms` and `/dmca` do not exist, and the footer has no legal links. A DMCA
-   agent contact (email and postal address) has not been supplied.
-6. **Seed content is stale and over the requested range.**
-   `src/worker/seed.ts` contains 14 threads (target was 8–12). The pinned
-   `boards-are-open` notice still says accounts, posting, and reports are
-   coming next, and `strip-metadata-before-you-upload` says stripping will ship
-   even though it already does. The deployed database has the `seed:v1` marker,
-   so source edits will not reach it without an idempotent `seed:v2` update.
-7. **Realtime delivery on Sites is unverified.**
-   Notifications and polling work locally. Delivery through the deployed
-   `REALTIME` binding has not been observed on the preview origin.
+### Launch checks still open
+1. **Realtime delivery on Sites is unverified.** Notifications and polling work
+   locally. Delivery through the deployed `REALTIME` binding has not been
+   observed on the preview origin.
+2. **DMCA agent is a placeholder.** The `/dmca` page needs the owner's real
+   agent name, email, and postal address, registered with the U.S. Copyright
+   Office.
+3. **Turnstile keys are not set.** The preview environment has no custom
+   variables (0 of 25). `VITE_TURNSTILE_SITE_KEY` must be present at build time
+   and `TURNSTILE_SECRET_KEY` set in Sites → Secrets before the gate is active.
+4. **The rich editor is not deployed yet.** The preview still serves the
+   Markdown toolbar build. The rich editor has been exercised signed-in on the
+   local preview (desktop and 390 px); a deployed signed-in pass is still
+   needed after the next preview deploy.
 
 ### Other gaps
-
 - M1.5 search, reactions, bookmarks, and quote storage are not built; they are
   planned in `PROJECT_SPEC.md` and are not launch blockers.
 - No dedicated Supporters Lounge board was seeded. Admins can create one with
   the existing board manager.
 - No email/transactional mail integration; notifications are in-app only.
-- The 14 seed threads exceed the M5 target of 8–12. Keeping them avoids empty
-  boards; trimming two gear threads would match the range exactly.
+- The audio and streaming boards have no seeded threads after the v2 trim; they
+  remain in the board tree as empty boards.
+- The local-preview demo identity is promoted to admin whenever hosted auth is
+  absent, which is intended for `/mod` and `/admin` demos; a deployment always
+  injects auth config and never takes that branch.
 
 ## Exact next step
 
-**Do this first:** fix the two staff-only data leaks, with regression tests.
+The rich-text editor is implemented and verified locally. The published
+preview still serves the Markdown build. Remaining work:
 
-1. In `src/worker/db.ts`, add a `subcategories` join and a viewer-role bind to
-   the recent-posts query inside `getProfile`, so staff-only threads are
-   excluded for public viewers.
-2. Add migration 6 and matching `schema.ts` changes for
-   `media.staff_only INTEGER NOT NULL DEFAULT 0`; set it when a board banner is
-   attached or a post is created in a staff-only board, and make
-   `GET /api/files/:id` return 404 for restricted media to viewers below
-   Supporter.
-3. Add tests in `tests/app.test.ts`: public profile hides staff-only excerpts;
-   public file fetch fails for staff-only post media; a Supporter can still
-   read both.
-4. Then continue M5 in this order: moderation staff/self guards → Turnstile
-   registration gate → `/terms` and `/dmca` pages and footer links → seed v2
-   copy refresh → `bun run typecheck`, `bun test`, `bun run build` → preview
+1. Deploy the rich editor to preview when requested, then verify signed-in
+   posting, quote, link, image, and rendered-post paths on that origin.
+2. Verify realtime notification delivery on the preview origin while signed in
+   as two accounts.
+3. Replace the DMCA agent placeholder once the owner supplies the details.
+4. Set `VITE_TURNSTILE_SITE_KEY` for the build and `TURNSTILE_SECRET_KEY` in
+   Sites → Secrets, then confirm a first sign-in is challenged and a returning
+   sign-in is not.
+5. Re-run `bun run typecheck`, `bun test`, and `bun run build` before the next
    deploy.
 
 ## Inputs or authorization still needed
@@ -148,7 +187,7 @@ current source; they are not yet fixed.
   public; the secret must be set in Sites → Secrets. The preview can use
   Cloudflare's documented always-pass test keys to exercise the flow, but those
   must not be treated as production protection.
-- **DMCA agent:** a real contact email and postal address for `/dmca`. A
-  clearly marked placeholder will be used until they are provided.
+- **DMCA agent:** a real contact email and postal address for `/dmca`. The page
+  shows a clearly marked placeholder until they are provided.
 - **Production:** publishing the production environment has not been
   authorized. M5 calls for a preview deployment only.

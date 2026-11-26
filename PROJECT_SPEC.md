@@ -17,6 +17,7 @@ long-lived processes.
 | Layer | Choice | Why |
 | --- | --- | --- |
 | UI | React 19 + Vite 8 | The Freebuff web-app starter's shape |
+| Rich text | TipTap 3 + DOMPurify + `rehype-sanitize` | Live WYSIWYG editing; canonical HTML stored with derived plain text |
 | API | Hono on the same Worker | One deployable, no separate service |
 | DB | D1 (SQLite) + Drizzle ORM | Only database Sites offers; Drizzle gives typed queries |
 | Auth | `@freebuff/auth` | No password material to store or reset |
@@ -92,7 +93,9 @@ Shipped in M0 (see `src/worker/schema.ts` and `migrations.ts`):
   `staff_only` for the Supporters Lounge.
 - `threads` — slug, title, prefix, pinned/locked, status
   (`published` / `held` / `removed`), timestamps.
-- `posts` — body, position, status, created/edited timestamps.
+- `posts` — derived plain-text `body`, nullable canonical `body_html`
+  (sanitised TipTap HTML), position, status, created/edited timestamps. Legacy
+  rows have `body_html = NULL` and render through the Markdown path.
 - `tags` / `thread_tags` — topic tags, separate from the thread prefix.
 - `schema_meta` — applied migration versions.
 - `app_meta` — seed marker.
@@ -131,6 +134,12 @@ Shipped in M4:
   Supporter access.
 - Supporter grants are manual admin actions stored in `audit_log`; there is no
   payment processor, webhook, payment ledger, or automatic expiry.
+
+New posts store derived plain text in `body` and canonical sanitised TipTap
+HTML in nullable `body_html`; legacy rows keep `body_html = NULL`. The browser
+and Worker each apply an allowlist. Editor colours, sizes, and alignment become
+`.tx-*`, `.fs-*`, and `.align-*` classes, never stored CSS. Poll/Embed inserts an
+external URL; native in-app polls are out of scope for this milestone.
 
 Planned, in milestone order: `reactions`, `bookmarks`, `subscriptions`,
 `user_cosmetics`.
@@ -191,11 +200,14 @@ assets binding.
 4. **No video files.** Video is embedded from an allowlisted provider and only
    its `{provider, id}` is stored; timestamps seek the provider player.
 5. **Every staff action is logged** with actor, target, action, reason, and time.
-6. **Markdown is sanitised with an allowlist** (`remark-parse` → `remark-gfm`
-   → `rehype-sanitize` → `rehype-stringify`) at render time; raw HTML in a post
-   is dropped. Media embeds are extracted as `{provider, id}` descriptors and
-   the browser builds the iframe URL from the allowlisted provider, never from
-   the user's raw URL.
+6. **Rich text is sanitised twice.** TipTap produces HTML in the browser;
+   DOMPurify filters it before saving, and the Worker independently parses and
+   sanitises it with `rehype-sanitize`. Editor styles are converted to
+   allowlisted classes, and raw HTML/CSS is never stored. Legacy Markdown posts
+   still pass through `remark-parse` → `remark-gfm` → `rehype-sanitize` →
+   `rehype-stringify`. Media embeds are extracted as `{provider, id}`
+   descriptors and the browser builds the iframe URL from the allowlisted
+   provider, never from the user's raw URL.
 7. **Turnstile on registration** once site keys exist; rate limits live in D1.
 
 ---
@@ -205,7 +217,7 @@ assets binding.
 | # | Scope | Status |
 | --- | --- | --- |
 | M0 | Starter, design system, schema + seed, board index, thread view | **Done** |
-| M1 | Accounts, profiles, trust levels, posting, Markdown + embeds | **Done** |
+| M1 | Accounts, profiles, trust levels, rich posting + legacy Markdown, embeds | **Done** |
 | M1.5 | Search, reactions, bookmarks, quote storage | Next |
 | M2 | Report queue, warnings, audit log, admin board manager | **Done** |
 | M3 | R2 uploads with EXIF strip, FOIA library, timestamps, realtime | **Done** |

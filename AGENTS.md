@@ -20,7 +20,7 @@ records what is done and what is next.
 | Files | R2 binding `FILES`; images only; metadata stripped before storage |
 | Auth | `@freebuff/auth` (Sign in with Freebuff, OIDC, HttpOnly session cookie); no passwords |
 | Realtime | Sites managed `REALTIME` Durable Object binding for notification wakeups; D1 is the source of truth |
-| Markdown | `remark` / `rehype` + `rehype-sanitize`; raw HTML is dropped |
+| Rich text | TipTap 3 + DOMPurify in the browser; `rehype-sanitize` again in the Worker; legacy Markdown remains readable |
 | Tests | `bun test` + Miniflare integration tests in `tests/app.test.ts` |
 | Package manager | Bun with `bun.lock` |
 | Deploy | Freebuff Sites with `deploy.json`; preview only on request, production only with explicit approval |
@@ -42,7 +42,9 @@ payment methods; Supporter status is granted manually.
 │   │   ├── admin.tsx           board manager and audit log
 │   │   ├── donations-admin.tsx admin donation settings and Supporter grants
 │   │   ├── donate.tsx          public donation page
-│   │   ├── composer.tsx        Markdown reply form
+│   │   ├── editor.tsx          TipTap post editor, toolbar, and popovers
+│   │   ├── rich-sanitize.ts    browser DOMPurify pass and class filter
+│   │   ├── rich-extensions.ts  TipTap extension setup
 │   │   ├── media.tsx           browser resize/re-encode and upload controls
 │   │   ├── notifications.tsx   header notification bell
 │   │   ├── foia.tsx            downloadable records-request library
@@ -52,6 +54,7 @@ payment methods; Supporter status is granted manually.
 │   ├── shared/                 code used by both client and Worker
 │   │   ├── types.ts            API DTOs
 │   │   ├── forum.ts            limits, prefixes, role tags, report reasons
+│   │   ├── richtext.ts         palette, classes, allowlists, URL rules
 │   │   ├── donations.ts        payment-method presets and limits
 │   │   └── foia.ts             FOIA templates
 │   └── worker/                 Hono API on Cloudflare Workers
@@ -74,7 +77,8 @@ payment methods; Supporter status is granted manually.
 │       ├── notifications.ts    durable notifications and unread counts
 │       ├── realtime.ts         Sites realtime tickets and publication
 │       ├── audit.ts            append-only staff audit log
-│       ├── markdown.ts         sanitised Markdown, embeds, timestamp links
+│       ├── markdown.ts         legacy Markdown, embeds, timestamp links
+│       ├── richtext.ts         TipTap HTML sanitizer and class mapping
 │       ├── text.ts             slugify and control-character cleaning
 │       └── result.ts           ok()/fail() mutation result helpers
 ├── tests/app.test.ts           integration/security tests (Miniflare + Bun)
@@ -142,10 +146,17 @@ Generated or ignored: `dist/`, `.wrangler/`, `node_modules/`,
 7. **Seeding is idempotent.** Seed-owned IDs use `seed:`/`th:`. Never delete real
    user content. A deployed database keeps its `seed:v1` marker, so copy changes
    need an explicit versioned seed update rather than a manual reseed.
-8. **No raw user HTML or CSS.** Markdown is sanitised at render time; raw HTML
-   is dropped. `dangerouslySetInnerHTML` is only for sanitised `post.html`.
+8. **No raw user HTML or CSS.** TipTap HTML is sanitised in the browser with
+   DOMPurify and again in the Worker with `rehype-sanitize`; editor styles are
+   mapped to allowlisted `.tx-*`, `.fs-*`, and `.align-*` classes. Legacy
+   Markdown rows still render through the sanitised Markdown path. `body` is
+   derived plain text and `body_html` is canonical HTML.
+   `dangerouslySetInnerHTML` is only for the client-sanitised `post.html`.
    In-post images must point at `/api/files/<uuid>`; external links get
    `rel="nofollow ugc noopener"` and `target="_blank"`.
+
+   Poll/Embed inserts an external URL. Known video and poll providers render as
+   descriptors; native in-app poll tables and voting are out of scope.
 9. **Images only.** Accept JPEG, PNG, and WebP by magic bytes, enforce the
    shared size/dimension limits, strip metadata server-side, and never accept
    video uploads. Store under R2 through the existing `media` helpers.

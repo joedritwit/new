@@ -25,7 +25,9 @@ starter content are created on first request.
 - `src/client/pages.tsx` — board, new-thread, and profile pages (with staff tools).
 - `src/client/mod.tsx` — staff report queue and actions.
 - `src/client/admin.tsx` — admin board manager and audit log.
-- `src/client/composer.tsx` — the Markdown reply form with image attach.
+- `src/client/editor.tsx` — the TipTap new-thread and reply editor with popovers.
+- `src/client/rich-sanitize.ts` — the browser DOMPurify pass and class filter.
+- `src/client/rich-extensions.ts` — TipTap extension configuration.
 - `src/client/media.tsx` — browser resize/re-encode and upload controls.
 - `src/client/notifications.tsx` — the header notification bell.
 - `src/client/donate.tsx` — the public donation page and payment methods.
@@ -36,7 +38,9 @@ starter content are created on first request.
 - `src/client/ui.tsx` — shared chips, avatars, embeds, and loading states.
 - `src/client/style.css` — the charcoal design system.
 - `src/worker/app.ts` — read API, session, posting, and profile routes.
-- `src/worker/markdown.ts` — sanitised Markdown, providers, and timestamp links.
+- `src/shared/richtext.ts` — palette, classes, allowlists, and URL rules.
+- `src/worker/markdown.ts` — legacy sanitised Markdown, providers, and timestamps.
+- `src/worker/richtext.ts` — TipTap HTML sanitizer and class mapping.
 - `src/worker/media.ts` — R2 uploads, image sniffing, and metadata stripping.
 - `src/worker/notifications.ts` — durable notifications and unread counts.
 - `src/worker/realtime.ts` — Sites realtime tickets and publication.
@@ -58,9 +62,11 @@ starter content are created on first request.
 Sign in with Freebuff provisions a local `users` row on first request. Roles and
 trust levels are computed server-side: new accounts cannot post links and are
 limited to three posts an hour until they have three posts and a day-old
-account. Posts are stored as Markdown and rendered through an allowlist
-sanitiser on read; YouTube and Rumble links become embeds, X links become link
-cards.
+account. New posts are written in the TipTap WYSIWYG editor; their canonical
+HTML is sanitised in the browser and again in the Worker, with derived plain
+text stored for excerpts. Legacy Markdown posts still render through the
+sanitised Markdown path. YouTube and Rumble links become embeds, X links become
+link cards.
 
 ## Moderation
 
