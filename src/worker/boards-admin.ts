@@ -1,6 +1,7 @@
 import { POST_MIN_ROLES, type PostMinRole } from '../shared/forum'
 import type { AdminBoard, AdminBoards, AdminCategory } from '../shared/types'
 import { logAudit } from './audit'
+import { restrictBoardPostMedia } from './media'
 import { fail, ok, type MutationResult } from './result'
 import { cleanName, slugify } from './text'
 import type { ViewerProfile } from './users'
@@ -274,6 +275,21 @@ export async function updateBoard(
     .prepare(`UPDATE subcategories SET ${sets.join(', ')} WHERE id = ?`)
     .bind(...binds, id)
     .run()
+
+  if (input.staffOnly !== undefined) {
+    // The banner follows its board both ways; post images only ever become
+    // more restricted, so an image shared into a public thread cannot leak a
+    // staff-only copy. The file route still re-checks the board on every read.
+    await db
+      .prepare(
+        `UPDATE media SET staff_only = ?
+         WHERE kind = 'board_banner'
+           AND id = (SELECT image_media_id FROM subcategories WHERE id = ?)`,
+      )
+      .bind(input.staffOnly ? 1 : 0, id)
+      .run()
+    if (input.staffOnly) await restrictBoardPostMedia(db, id)
+  }
 
   const action =
     input.archived === true

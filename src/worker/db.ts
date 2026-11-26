@@ -12,8 +12,14 @@ import type {
   ThreadDetail,
   ThreadPost,
 } from '../shared/types'
-import { extractEmbeds, isSeekableEmbed, renderMarkdown } from './markdown'
+import {
+  extractEmbeds,
+  extractEmbedsFromUrls,
+  isSeekableEmbed,
+  renderMarkdown,
+} from './markdown'
 import { MIGRATIONS } from './migrations'
+import { renderRichHtml } from './richtext'
 import { staffProfileFor } from './moderation'
 import { canReadRestricted, isStaff } from './roles'
 import * as schema from './schema'
@@ -343,11 +349,31 @@ export async function getThread(
       .first<{ count: number }>(),
   ])
 
-  const hasSeekableVideo = postRows.some(({ post }) =>
-    extractEmbeds(post.body).some(isSeekableEmbed),
+  const prepared = postRows.map(({ post, author }) => {
+    const embeds =
+      post.bodyHtml === null
+        ? extractEmbeds(post.body)
+        : extractEmbedsFromUrls(renderRichHtml(post.bodyHtml).links)
+    return { post, author, embeds }
+  })
+  const hasSeekableVideo = prepared.some(({ embeds }) =>
+    embeds.some(isSeekableEmbed),
   )
 
-  const posts: ThreadPost[] = postRows.map(({ post, author }) => {
+  const posts: ThreadPost[] = prepared.map(({ post, author }) => {
+    if (post.bodyHtml !== null) {
+      const rendered = renderRichHtml(post.bodyHtml, {
+        linkTimestamps: hasSeekableVideo,
+      })
+      return {
+        id: post.id,
+        body: post.body,
+        html: rendered.html,
+        embeds: extractEmbedsFromUrls(rendered.links),
+        createdAt: post.createdAt,
+        author: mapAuthor(author),
+      }
+    }
     const rendered = renderMarkdown(post.body, {
       linkTimestamps: hasSeekableVideo,
     })
@@ -419,11 +445,13 @@ export async function getProfile(
                 t.slug AS threadSlug, t.title AS threadTitle
          FROM posts p
          JOIN threads t ON t.id = p.thread_id
+         JOIN subcategories s ON s.id = t.subcategory_id
          WHERE p.author_id = ? AND p.status = 'published' AND t.status = 'published'
+           AND (s.staff_only = 0 OR ? = 1)
          ORDER BY p.created_at DESC
          LIMIT 8`,
       )
-      .bind(user.id)
+      .bind(user.id, canReadRestricted(viewerRole) ? 1 : 0)
       .all<{
         id: string
         at: number

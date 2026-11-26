@@ -4,6 +4,11 @@ import remarkGfm from 'remark-gfm'
 import remarkParse from 'remark-parse'
 import remarkRehype from 'remark-rehype'
 import { unified } from 'unified'
+import {
+  FORMAT_CLASSES,
+  formatClass,
+  isFormatKind,
+} from '../shared/format'
 import { PEERTUBE_HOSTS } from '../shared/forum'
 import type { Embed } from '../shared/types'
 
@@ -13,12 +18,146 @@ import type { Embed } from '../shared/types'
  * on top. Links are hardened after sanitising so the attributes survive.
  */
 
-type HastNode = {
+export type HastNode = {
   type: string
   tagName?: string
   properties?: Record<string, unknown>
   value?: string
   children?: HastNode[]
+}
+
+type FormatOpen = {
+  node: HastNode
+  name: string
+  openText: string
+}
+
+/**
+ * Editor-only inline syntax. The toolbar inserts it, and this transform runs
+ * before sanitising so only values in `src/shared/format.ts` become elements.
+ * Malformed tags stay literal text.
+ */
+function parseFormatOpen(
+  name: string,
+  value: string | undefined,
+): { tagName: string; className?: string } | null {
+  if (name === 'u') return value === undefined ? { tagName: 'u' } : null
+  if (value === undefined || !isFormatKind(name)) return null
+  const className = formatClass(name, value)
+  return className ? { tagName: 'span', className } : null
+}
+
+function mergeText(nodes: HastNode[]): HastNode[] {
+  const merged: HastNode[] = []
+  for (const node of nodes) {
+    const previous = merged[merged.length - 1]
+    if (node.type === 'text' && previous?.type === 'text') {
+      previous.value = `${previous.value ?? ''}${node.value ?? ''}`
+      continue
+    }
+    merged.push(node)
+  }
+  return merged
+}
+
+function processFormatChildren(parent: HastNode): void {
+  if (!parent.children) return
+  const nodes = mergeText(parent.children)
+  const output: HastNode[] = []
+  const open: FormatOpen[] = []
+
+  const emit = (node: HastNode) => {
+    const current = open[open.length - 1]
+    if (current) current.node.children!.push(node)
+    else output.push(node)
+  }
+
+  for (const child of nodes) {
+    if (child.type === 'element') {
+      // Code samples stay literal, including any bracket tags.
+      if (child.tagName !== 'code' && child.tagName !== 'pre')
+        processFormatChildren(child)
+      emit(child)
+      continue
+    }
+    if (child.type !== 'text' || !child.value) {
+      emit(child)
+      continue
+    }
+
+    let last = 0
+    for (const match of child.value.matchAll(
+      /\[(\/?)(u|color|size|font)(?:=([a-z]+))?\]/gi,
+    )) {
+      const index = match.index ?? 0
+      if (index > last)
+        emit({ type: 'text', value: child.value.slice(last, index) })
+
+      const closing = match[1] === '/'
+      const name = match[2]!.toLowerCase()
+      const value = match[3]?.toLowerCase()
+
+      if (closing) {
+        const current = open[open.length - 1]
+        if (current?.name === name && value === undefined) {
+          open.pop()
+          emit(current.node)
+        } else {
+          emit({ type: 'text', value: match[0] })
+        }
+      } else {
+        const parsed = parseFormatOpen(name, value)
+        if (!parsed) {
+          emit({ type: 'text', value: match[0] })
+        } else {
+          open.push({
+            node: {
+              type: 'element',
+              tagName: parsed.tagName,
+              properties: parsed.className
+                ? { className: [parsed.className] }
+                : {},
+              children: [],
+            },
+            name,
+            openText: match[0],
+          })
+        }
+      }
+      last = index + match[0].length
+    }
+    if (last < child.value.length)
+      emit({ type: 'text', value: child.value.slice(last) })
+  }
+
+  // Unclosed tags are shown as typed rather than swallowing the text.
+  while (open.length) {
+    const format = open.pop()!
+    emit({ type: 'text', value: format.openText })
+    for (const child of format.node.children ?? []) emit(child)
+  }
+
+  parent.children = output
+}
+
+function formatSpans() {
+  return (tree: HastNode) => {
+    processFormatChildren(tree)
+  }
+}
+
+const spanClassName: [string, ...string[]] = [
+  'className',
+  ...FORMAT_CLASSES,
+]
+
+const sanitizeSchema = {
+  ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames ?? []), 'u', 'span'],
+  attributes: {
+    ...defaultSchema.attributes,
+    span: [spanClassName],
+  },
 }
 
 function hardenLinks() {
@@ -83,7 +222,7 @@ function secondsOfStamp(value: string): number | null {
 const STAMP = /\b(\d{1,2}:\d{2}(?::\d{2})?)\b/g
 
 /** Turns timestamps in prose into links that seek the thread's video. */
-function linkTimestamps() {
+export function linkTimestamps() {
   return (tree: HastNode) => {
     const split = (value: string): HastNode[] => {
       const nodes: HastNode[] = []
@@ -140,7 +279,8 @@ const processors = {
     .use(remarkParse)
     .use(remarkGfm)
     .use(remarkRehype)
-    .use(rehypeSanitize, defaultSchema)
+    .use(formatSpans)
+    .use(rehypeSanitize, sanitizeSchema)
     .use(restrictImages)
     .use(hardenLinks)
     .use(rehypeStringify),
@@ -148,7 +288,8 @@ const processors = {
     .use(remarkParse)
     .use(remarkGfm)
     .use(remarkRehype)
-    .use(rehypeSanitize, defaultSchema)
+    .use(formatSpans)
+    .use(rehypeSanitize, sanitizeSchema)
     .use(restrictImages)
     .use(hardenLinks)
     .use(linkTimestamps)
@@ -278,6 +419,10 @@ export function extractEmbeds(source: string, limit = 3): Embed[] {
   }
 
   return found
+}
+
+export function extractEmbedsFromUrls(urls: string[], limit = 3): Embed[] {
+  return extractEmbeds(urls.join('\n'), limit)
 }
 
 export function isSeekableEmbed(embed: Embed): boolean {
