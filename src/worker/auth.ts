@@ -9,6 +9,7 @@ export type Env = {
   FREEBUFF_CLIENT_ID?: string
   FREEBUFF_ISSUER?: string
   APP_ORIGIN?: string
+  TURNSTILE_SECRET_KEY?: string
 }
 
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]'])

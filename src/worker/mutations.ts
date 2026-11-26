@@ -1,6 +1,7 @@
 import type { PostMinRole, ThreadPrefix } from '../shared/forum'
 import { LIMITS, THREAD_PREFIXES } from '../shared/forum'
 import type { Env } from './auth'
+import { restrictReferencedMedia } from './media'
 import { notifyReply } from './notifications'
 import { fail, ok, type MutationResult } from './result'
 import { canPostIn, canReadRestricted } from './roles'
@@ -55,8 +56,15 @@ async function checkRateLimit(
   )
 }
 
-function checkLinks(viewer: ViewerProfile, body: string) {
-  if (canPostLinks(viewer.trustLevel) || !EXTERNAL_LINK.test(body)) return null
+function checkLinks(
+  viewer: ViewerProfile,
+  body: string,
+  bodyHtml?: string,
+) {
+  const hasExternalLink =
+    EXTERNAL_LINK.test(body) ||
+    (bodyHtml ? /href="https?:\/\//i.test(bodyHtml) : false)
+  if (canPostLinks(viewer.trustLevel) || !hasExternalLink) return null
   return fail(
     403,
     'Links unlock once your account is 24 hours old and has 3 posts. Post the source in plain text for now.',
@@ -83,11 +91,13 @@ export async function createThread(
     boardId: string
     title: string
     body: string
+    bodyHtml?: string | null
     prefix: ThreadPrefix | null
   },
 ): Promise<MutationResult<{ slug: string }>> {
   const title = cleanName(input.title)
   const body = input.body.trim()
+  const bodyHtml = input.bodyHtml?.trim() || null
 
   const invalid = validateTitle(title) ?? validateBody(body) ?? checkMute(viewer)
   if (invalid) return invalid
@@ -112,7 +122,7 @@ export async function createThread(
   if (!canPostIn(viewer.row.staffRole, board.postMinRole))
     return fail(403, 'Your account cannot start threads in that board.')
 
-  const linkProblem = checkLinks(viewer, body)
+  const linkProblem = checkLinks(viewer, body, bodyHtml ?? undefined)
   if (linkProblem) return linkProblem
   const rateProblem = await checkRateLimit(db, viewer)
   if (rateProblem) return rateProblem
@@ -132,11 +142,19 @@ export async function createThread(
       .bind(id, board.id, viewer.row.id, slug, title, input.prefix, now, now),
     db
       .prepare(
-        `INSERT INTO posts (id, thread_id, author_id, body, status, position, created_at)
-         VALUES (?, ?, ?, ?, 'published', 0, ?)`,
+        `INSERT INTO posts (
+           id, thread_id, author_id, body, body_html, status, position, created_at
+         ) VALUES (?, ?, ?, ?, ?, 'published', 0, ?)`,
       )
-      .bind(`${id}:p0`, id, viewer.row.id, body, now),
+      .bind(`${id}:p0`, id, viewer.row.id, body, bodyHtml, now),
   ])
+
+  if (board.staffOnly)
+    await restrictReferencedMedia(
+      db,
+      viewer.row.id,
+      `${body}\n${bodyHtml ?? ''}`,
+    )
 
   return ok({ slug })
 }
@@ -146,9 +164,11 @@ export async function createReply(
   viewer: ViewerProfile,
   slug: string,
   body: string,
+  bodyHtml: string | null | undefined,
   env?: Env,
 ): Promise<MutationResult<{ ok: true }>> {
   const text = body.trim()
+  const html = bodyHtml?.trim() || null
   const invalid = validateBody(text) ?? checkMute(viewer)
   if (invalid) return invalid
 
@@ -179,7 +199,7 @@ export async function createReply(
   if (!canPostIn(viewer.row.staffRole, thread.postMinRole))
     return fail(403, 'Your account cannot reply in that board.')
 
-  const linkProblem = checkLinks(viewer, text)
+  const linkProblem = checkLinks(viewer, text, html ?? undefined)
   if (linkProblem) return linkProblem
   const rateProblem = await checkRateLimit(db, viewer)
   if (rateProblem) return rateProblem
@@ -196,14 +216,16 @@ export async function createReply(
   await db.batch([
     db
       .prepare(
-        `INSERT INTO posts (id, thread_id, author_id, body, status, position, created_at)
-         VALUES (?, ?, ?, ?, 'published', ?, ?)`,
+        `INSERT INTO posts (
+           id, thread_id, author_id, body, body_html, status, position, created_at
+         ) VALUES (?, ?, ?, ?, ?, 'published', ?, ?)`,
       )
       .bind(
         postId,
         thread.id,
         viewer.row.id,
         text,
+        html,
         next?.position ?? 1,
         now,
       ),
@@ -211,6 +233,13 @@ export async function createReply(
       .prepare('UPDATE threads SET last_activity_at = ? WHERE id = ?')
       .bind(now, thread.id),
   ])
+
+  if (thread.staffOnly)
+    await restrictReferencedMedia(
+      db,
+      viewer.row.id,
+      `${text}\n${html ?? ''}`,
+    )
 
   await notifyReply(db, env, {
     actorId: viewer.row.id,

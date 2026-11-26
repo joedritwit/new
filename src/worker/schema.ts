@@ -22,6 +22,9 @@ export const media = sqliteTable(
     status: text('status', { enum: ['active', 'removed'] })
       .notNull()
       .default('active'),
+    staffOnly: integer('staff_only', { mode: 'boolean' })
+      .notNull()
+      .default(false),
     createdAt: integer('created_at').notNull(),
   },
   (table) => [
@@ -130,6 +133,8 @@ export const posts = sqliteTable(
       .notNull()
       .references(() => users.id),
     body: text('body').notNull(),
+    // Canonical sanitised TipTap HTML. Null means the body is legacy Markdown.
+    bodyHtml: text('body_html'),
     status: text('status', { enum: ['published', 'held', 'removed'] })
       .notNull()
       .default('published'),

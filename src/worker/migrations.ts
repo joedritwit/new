@@ -231,4 +231,14 @@ export const MIGRATIONS: Migration[] = [
          ON donation_methods (enabled, sort_order)`,
     ],
   },
+  {
+    version: 6,
+    statements: [
+      `ALTER TABLE media ADD COLUMN staff_only INTEGER NOT NULL DEFAULT 0`,
+    ],
+  },
+  {
+    version: 7,
+    statements: [`ALTER TABLE posts ADD COLUMN body_html TEXT`],
+  },
 ]
